@@ -4,6 +4,7 @@ vim.wo.relativenumber = true
 vim.wo.number = true
 
 vim.keymap.set('t', 'jk', [[<C-\><C-n>]], {noremap = true, silent = true})
+
 local function send_yank_to_term()
   local save_win = vim.api.nvim_get_current_win()
   local save_buf = vim.api.nvim_get_current_buf()
@@ -38,8 +39,362 @@ local function send_yank_to_term()
   vim.api.nvim_set_current_win(save_win)
   vim.api.nvim_set_current_buf(save_buf)
 end
+--vim.keymap.set("n","<C-J>", function()
+--  send_yank_to_term()
+--end, { noremap = true, silent = true })
+---------------------------------------------------------------------------------------
+-- Set these to your manually opened GHCI buffer/job
+-- Send lines to terminal buffer and capture output into a register
+_G.sent_lines_count = 0
+function SendToTermAndCapture(bufnr, lines, register)
+  local term_job_id = vim.b[bufnr].terminal_job_id
+  if not term_job_id then
+    print("Not a terminal buffer")
+    return
+  end
 
-vim.keymap.set("n","<C-J>", function()
-  send_yank_to_term()
-end, { noremap = true, silent = true })
+  local output = {}
+
+  -- Attach to terminal buffer to capture new lines
+  vim.api.nvim_buf_attach(bufnr, false, {
+    on_lines = function(_, _, _, _, new_lines, _)
+      if type(new_lines) == "table" then
+        for _, line in ipairs(new_lines) do
+          table.insert(output, line)
+        end
+      end
+      return false
+    end,
+  })
+
+  -- Send each line to the terminal
+  for _, line in ipairs(lines) do
+    vim.fn.chansend(term_job_id, line .. "\n")
+  end
+  _G.sent_lines_count = _G.sent_lines_count + #lines
+
+  -- Wait a bit to collect output, then save to register
+--  vim.defer_fn(function()
+--    vim.fn.setreg(register, table.concat(output, "\n"))
+--    print("Captured output to register " .. register)
+--  end, 700) -- increase delay if your commands take longer
+end
+
+-- Example usage:
+-- :lua SendToTermAndCapture(2, {"1+1", "2+2"}, "a")
+-- Get the last n lines from a buffer
+-- Get the first n lines from a buffer
+function SendYankToTerm()
+  local bufnr = 3
+  local register = '"'
+  -- Get yanked lines from the unnamed register
+  local lines = vim.fn.getreg('"', 1, true)  -- 1 = get as list of lines
+
+  if #lines == 0 then
+    print("No yanked text found")
+    return
+  end
+
+  -- Call your existing function
+  SendToTermAndCapture(bufnr, lines, register)
+end
+
+function GetFirstLines(bufnr, n, register)
+  -- Get total number of lines in the buffer
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+
+  -- Calculate end line (0-indexed, exclusive)
+  local end_line = math.min(n, line_count)
+
+  -- Get the first n lines
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, end_line, false)
+
+  -- If register is given, save to it
+  if register then
+    vim.fn.setreg(register, table.concat(lines, "\n"))
+    print("Saved first " .. n .. " lines to register " .. register)
+  end
+
+  return lines
+end
+-- Yank all lines from a buffer into a register
+_G.ghci_prompt_count = 0
+function YankTerminalOutput(bufnr)
+  -- Get total number of lines in the buffer
+  local line_count = vim.api.nvim_buf_line_count(bufnr)
+  
+  -- Get all lines
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, line_count, false)
+  
+  -- Store in register
+
+  --count it
+  local last_count=_G.ghci_prompt_count
+  local count = 0
+  for _, line in ipairs(lines) do
+    for _ in line:gmatch("ghci>") do
+      count = count + 1
+    end
+  end
+  _G.ghci_prompt_count = count
+  
+  return lines,last_count
+end
+
+function GetNewTerminalOutput(lines, last_count, register)
+  local ghci_seen = 0
+  local start_line = 0
+
+  for i, line in ipairs(lines) do
+    for _ in line:gmatch("ghci>") do
+      ghci_seen = ghci_seen + 1
+    end
+    if ghci_seen == last_count then
+      start_line = i
+      break
+    end
+  end
+
+  local new_lines = {}
+  for i = start_line + 1, #lines do
+    table.insert(new_lines, lines[i])
+  end
+
+  return new_lines
+end
+function DropGHCiPromptLines(lines)
+  local result = {}
+  for _, line in ipairs(lines) do
+    if not line:match("ghci>") then
+      table.insert(result, line)
+    end
+  end
+  return result
+end
+
+function TrimTrailingEmptyLines(lines)
+  local last_nonempty = #lines
+  for i = #lines, 1, -1 do
+    if lines[i]:match("%S") then  -- contains a non-space character
+      last_nonempty = i
+      break
+    end
+  end
+
+  local trimmed = {}
+  for i = 1, last_nonempty do
+    table.insert(trimmed, lines[i])
+  end
+
+  return trimmed
+end
+function YankNewTerminalOutputDefault()
+  local bufnr = 3       -- terminal buffer number
+  local register = '"'  -- unnamed register
+
+  local lines, count = YankTerminalOutput(bufnr)
+  local mid_lines = GetNewTerminalOutput(lines, count)
+  local new_lines = DropGHCiPromptLines(mid_lines)
+  local new_lines = TrimTrailingEmptyLines(new_lines)
+
+  if register then
+    vim.fn.setreg(register, table.concat(new_lines, "\n"))
+    print("Yanked " .. #new_lines .. " new lines into register " .. register)
+  end
+
+  -- Call the combined function
+  return new_lines
+end
+
+
+function SendYankAndCapture(callback)
+  SendYankToTerm()
+  vim.defer_fn(function()
+    local new_lines = YankNewTerminalOutputDefault()
+    if callback then
+      callback(new_lines)
+    end
+  end, 200) -- wait 200ms
+end
+--function SendYankAndCapture()
+--  -- 1. Send yanked lines
+--  SendYankToTerm()
+--
+--  -- 2. Wait a bit (adjust delay if needed) and then capture output
+--  vim.defer_fn(function()
+--    local new_lines = YankNewTerminalOutputDefault()  -- gets new output, cleans ghci> lines
+--    print("Captured " .. #new_lines .. " lines from terminal")
+--    -- Optionally, inspect lines:
+--    -- print(vim.inspect(new_lines))
+--  end, 200)  -- 200ms delay; increase if terminal commands take longer
+--end
+
+-- Yank lines between ---HS (upwards) and ---HF (downwards) relative to cursor
+
+function YankBlockBetweenMarkers()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local row = cursor[1] - 1  -- 0-indexed
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local start_line, end_line
+
+  -- Search upwards for ---HS
+  for i = row, 0, -1 do
+    if lines[i + 1]:match("^%s*---HS") then
+      start_line = i + 1  -- line after marker
+      break
+    end
+  end
+  if not start_line then
+    print("No ---HS marker found above")
+    return
+  end
+
+  -- Search downwards for ---HF
+  for i = row + 1, #lines do
+    if lines[i]:match("^%s*---HF") then
+      end_line = i - 1  -- line before marker
+      break
+    end
+  end
+  if not end_line then
+    print("No ---HF marker found below")
+    return
+  end
+
+  -- Get the block
+  local block = vim.api.nvim_buf_get_lines(bufnr, start_line, end_line , false)
+
+  -- Store in unnamed register
+  vim.fn.setreg('"', table.concat(block, "\n"))
+  --print("Yanked " .. #block .. " lines between ---HS and ---HF")
+  return block
+end
+
+function ReplaceHFtoNextHS(replacement_text)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local start_row = cursor[1] - 1  -- 0-indexed
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+  local hf_line, hs_line
+
+  -- Find the next ---HF from cursor
+  for i = start_row + 1, #lines do
+    if lines[i]:match("^%s*---HF") then
+      hf_line = i
+      break
+    end
+  end
+  if not hf_line then
+    print("No ---HF found below cursor")
+    return
+  end
+
+  -- Find the next ---HS after the ---HF
+  for i = hf_line + 1, #lines do
+    if lines[i]:match("^%s*---HS") then
+      hs_line = i
+      break
+    end
+  end
+  if not hs_line then
+    print("No ---HS found after ---HF")
+    return
+  end
+
+  -- Delete everything **between ---HF and ---HS** (exclusive of markers)
+  local delete_start = hf_line + 1
+  local delete_end = hs_line - 1
+  if delete_end >= delete_start then
+    vim.api.nvim_buf_set_lines(bufnr, delete_start-1, delete_end , false, {})
+  end
+
+  -- Insert replacement text at delete_start
+  local replacement_lines = {}
+  for line in replacement_text:gmatch("[^\n]+") do
+    table.insert(replacement_lines, line)
+  end
+  vim.api.nvim_buf_set_lines(bufnr, delete_start-1, delete_start-1, false, replacement_lines)
+
+  print("Replaced block between ---HF and next ---HS with replacement text")
+end
+
+function NoteBook()
+  -- 1. Yank the block between ---HS and ---HF
+  YankBlockBetweenMarkers()
+
+  -- 2. Send to terminal and capture output asynchronously
+  SendYankAndCapture(function(lines)
+    -- lines is now the captured output after the terminal processed the input
+    print("Captured " .. #lines .. " lines from terminal")
+
+    -- Convert lines table to a string for ReplaceHFtoNextHS
+    local replacement_text = table.concat(lines, "\n")
+
+    -- 3. Replace the next ---HF → ---HS block with the captured output
+    ReplaceHFtoNextHS(replacement_text)
+  end)
+end
+vim.api.nvim_set_keymap(
+  'n',               -- normal mode
+  '<C-J>',           -- key combination
+  [[:lua NoteBook()<CR>]], -- command to run
+  { noremap = true, silent = true }  -- options
+)
+
+-- Create a new empty ---HS ... ---HF block at the next marker
+-- Insert an empty ---HS ... ---HF block before the next ---HS marker
+function CreateEmptyBlockBeforeNextHS()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local start_row = cursor[1] - 1  -- 0-indexed
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+  local insert_line
+
+  -- Find the next ---HS from cursor
+  for i = start_row + 1, #lines do
+    if lines[i]:match("^%s*---HS") then
+      insert_line = i
+      break
+    end
+  end
+
+  -- If no ---HS found, append at the end
+  if not insert_line then
+    insert_line = #lines
+  end
+
+  -- Prepare empty block
+  local block = { "---HS", "", "---HF" }
+
+  -- Insert the block **before** the next ---HS
+  vim.api.nvim_buf_set_lines(bufnr, insert_line-1, insert_line-1, false, block)
+
+  -- Move cursor to the empty line inside the new block
+  vim.api.nvim_win_set_cursor(0, { insert_line + 2, 0 })
+
+  print("Inserted empty ---HS ... ---HF block before next ---HS")
+end
+
+vim.api.nvim_set_keymap(
+  'n',               -- normal mode
+  '<C-N>',           -- key combination
+  [[:lua CreateEmptyBlockBeforeNextHS()<CR>]], -- command to run
+  { noremap = true, silent = true }  -- options
+)
+-- Usage:
+-- Place cursor somewhere in the block and call:
+-- :lua YankBlockBetweenMarkers()
+-- Then paste with p
+
+
+-- Example usage:
+--
+-- :lua YankTerminalOutput(2, "a")  -- yanks all output from buffer 2 into register "a"
+
+-- Example usage:
+-- :lua GetFirstLines(2, 5, "a")  -- gets first 5 lines from buffer 2 and saves to "a"
 
