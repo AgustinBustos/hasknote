@@ -241,7 +241,7 @@ function YankBlockBetweenMarkers()
 
   -- Search upwards for ---HS
   for i = row, 0, -1 do
-    if lines[i + 1]:match("^%s*---HS") then
+    if lines[i + 1]:match("--------------------------------------------------------------------------------------------------------------------------------------------HS*") then
       start_line = i + 1  -- line after marker
       break
     end
@@ -253,7 +253,7 @@ function YankBlockBetweenMarkers()
 
   -- Search downwards for ---HF
   for i = row + 1, #lines do
-    if lines[i]:match("^%s*---HF") then
+    if lines[i]:match("--------------------------------------------------------------------HF*") then
       end_line = i - 1  -- line before marker
       break
     end
@@ -282,7 +282,7 @@ function ReplaceHFtoNextHS(replacement_text)
 
   -- Find the next ---HF from cursor
   for i = start_row + 1, #lines do
-    if lines[i]:match("^%s*---HF") then
+    if lines[i]:match("--------------------------------------------------------------------HF*") then
       hf_line = i
       break
     end
@@ -294,7 +294,7 @@ function ReplaceHFtoNextHS(replacement_text)
 
   -- Find the next ---HS after the ---HF
   for i = hf_line + 1, #lines do
-    if lines[i]:match("^%s*---HS") then
+    if lines[i]:match("--------------------------------------------------------------------------------------------------------------------------------------------HS*") then
       hs_line = i
       break
     end
@@ -344,40 +344,32 @@ vim.api.nvim_set_keymap(
   { noremap = true, silent = true }  -- options
 )
 
--- Create a new empty ---HS ... ---HF block at the next marker
--- Insert an empty ---HS ... ---HF block before the next ---HS marker
+
 function CreateEmptyBlockBeforeNextHS()
   local bufnr = vim.api.nvim_get_current_buf()
+
   local cursor = vim.api.nvim_win_get_cursor(0)
-  local start_row = cursor[1] - 1  -- 0-indexed
+  local start_row = cursor[1] 
+  --print(start_row)
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
 
-  local insert_line
+  local insert_line=#lines
 
-  -- Find the next ---HS from cursor
-  for i = start_row + 1, #lines do
-    if lines[i]:match("^%s*---HS") then
-      insert_line = i
+  for i = start_row, #lines do
+    if lines[i]:match("%-%-*HS") then
+      insert_line = i-1
       break
     end
   end
 
-  -- If no ---HS found, append at the end
-  if not insert_line then
-    insert_line = #lines
-  end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local block = { "--------------------------------------------------------------------------------------------------------------------------------------------HS", "", "--------------------------------------------------------------------HF" }
 
-  -- Prepare empty block
-  local block = { "---HS", "", "---HF" }
-
-  -- Insert the block **before** the next ---HS
-  vim.api.nvim_buf_set_lines(bufnr, insert_line-1, insert_line-1, false, block)
-
-  -- Move cursor to the empty line inside the new block
-  vim.api.nvim_win_set_cursor(0, { insert_line + 2, 0 })
-
-  print("Inserted empty ---HS ... ---HF block before next ---HS")
+  vim.api.nvim_buf_set_lines(bufnr, insert_line, insert_line, false, block)
+  vim.api.nvim_win_set_cursor(0,{insert_line+2,0})
 end
+
+
 
 vim.api.nvim_set_keymap(
   'n',               -- normal mode
