@@ -214,7 +214,8 @@ function SendYankAndCapture(callback)
     if callback then
       callback(new_lines)
     end
-  end, 200) -- wait 200ms
+  end, 500) -- wait 200ms
+  -- end, 200) -- wait 200ms
 end
 --function SendYankAndCapture()
 --  -- 1. Send yanked lines
@@ -241,7 +242,7 @@ function YankBlockBetweenMarkers()
 
   -- Search upwards for ---HS
   for i = row, 0, -1 do
-    if lines[i + 1]:match("--------------------------------------------------------------------------------------------------------------------------------------------HS*") then
+    if lines[i + 1]:match("%-%-*HS") then
       start_line = i + 1  -- line after marker
       break
     end
@@ -253,7 +254,7 @@ function YankBlockBetweenMarkers()
 
   -- Search downwards for ---HF
   for i = row + 1, #lines do
-    if lines[i]:match("--------------------------------------------------------------------HF*") then
+    if lines[i]:match("%-%-*HF") then
       end_line = i - 1  -- line before marker
       break
     end
@@ -282,7 +283,7 @@ function ReplaceHFtoNextHS(replacement_text)
 
   -- Find the next ---HF from cursor
   for i = start_row + 1, #lines do
-    if lines[i]:match("--------------------------------------------------------------------HF*") then
+    if lines[i]:match("%-%-*HF") then
       hf_line = i
       break
     end
@@ -294,7 +295,7 @@ function ReplaceHFtoNextHS(replacement_text)
 
   -- Find the next ---HS after the ---HF
   for i = hf_line + 1, #lines do
-    if lines[i]:match("--------------------------------------------------------------------------------------------------------------------------------------------HS*") then
+    if lines[i]:match("%-%-*HS") then
       hs_line = i
       break
     end
@@ -377,16 +378,7 @@ vim.api.nvim_set_keymap(
   [[:lua CreateEmptyBlockBeforeNextHS()<CR>]], -- command to run
   { noremap = true, silent = true }  -- options
 )
--- Usage:
--- Place cursor somewhere in the block and call:
--- :lua YankBlockBetweenMarkers()
--- Then paste with p
 
 
--- Example usage:
---
--- :lua YankTerminalOutput(2, "a")  -- yanks all output from buffer 2 into register "a"
-
--- Example usage:
--- :lua GetFirstLines(2, 5, "a")  -- gets first 5 lines from buffer 2 and saves to "a"
-
+-- keep track of runs to return good output in ghci
+-- accept multiline input
