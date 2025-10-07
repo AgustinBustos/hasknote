@@ -1,5 +1,9 @@
 vim.api.nvim_set_keymap('i', 'jk', '<Esc>', { noremap = true, silent = true })
 
+--vim.keymap.set('n', '<F9>', ':bprevious<CR>', { noremap = true, silent = true })
+--vim.keymap.set('n', '<F10>', ':bnext<CR>', { noremap = true, silent = true })
+--vim.keymap.set('n', '<F9>', vim.cmd.bprevious, { silent = true })
+
 vim.wo.relativenumber = true
 vim.wo.number = true
 
@@ -88,7 +92,28 @@ function SendYankToTerm()
   local bufnr = 3
   local register = '"'
   -- Get yanked lines from the unnamed register
-  local lines = vim.fn.getreg('"', 1, true)  -- 1 = get as list of lines
+  local prelines = vim.fn.getreg('"', 1, true)  -- 1 = get as list of lines
+  lines={}
+  last_insertion=""
+  for idx,line in ipairs(prelines) do
+    tostartwith=line:gsub("^%s*where", "where")
+    if string.sub(tostartwith,1,string.len("where"))=="where" then
+      print("here")
+      print(tostartwith)
+      last_insertion = string.sub(last_insertion, 1, -2) .. tostartwith
+    else
+      last_insertion = last_insertion .. line
+    end
+    local lastChar = string.sub(line, -1)
+    if lastChar~=';' then 
+      print(last_insertion)
+      table.insert(lines,last_insertion)
+      last_insertion=""
+
+    end
+  end
+  
+  
 
   if #lines == 0 then
     print("No yanked text found")
@@ -382,3 +407,4 @@ vim.api.nvim_set_keymap(
 
 -- keep track of runs to return good output in ghci
 -- accept multiline input
+-- it starts using a lot of ram with time, so i need to sometimes clear all history 
