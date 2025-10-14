@@ -6,6 +6,8 @@ vim.api.nvim_set_keymap('i', 'jk', '<Esc>', { noremap = true, silent = true })
 
 vim.wo.relativenumber = true
 vim.wo.number = true
+vim.g.mapleader = ' '
+vim.g.maplocalleader = ' ' -- Optional: also set the local leader to space
 
 vim.keymap.set('t', 'jk', [[<C-\><C-n>]], {noremap = true, silent = true})
 
@@ -97,16 +99,16 @@ function SendYankToTerm()
   last_insertion=""
   for idx,line in ipairs(prelines) do
     tostartwith=line:gsub("^%s*where", "where")
+    tostartwith=tostartwith:gsub("^%s*|>", "|>")
     if string.sub(tostartwith,1,string.len("where"))=="where" then
-      print("here")
-      print(tostartwith)
+      last_insertion = string.sub(last_insertion, 1, -2) .. tostartwith
+    elseif string.sub(tostartwith,1,string.len("|>"))=="|>" then
       last_insertion = string.sub(last_insertion, 1, -2) .. tostartwith
     else
       last_insertion = last_insertion .. line
     end
     local lastChar = string.sub(line, -1)
     if lastChar~=';' then 
-      print(last_insertion)
       table.insert(lines,last_insertion)
       last_insertion=""
 
@@ -365,7 +367,8 @@ function NoteBook()
 end
 vim.api.nvim_set_keymap(
   'n',               -- normal mode
-  '<C-J>',           -- key combination
+  '<leader>j',
+  --'<C-J>',           -- key combination
   [[:lua NoteBook()<CR>]], -- command to run
   { noremap = true, silent = true }  -- options
 )
@@ -399,12 +402,13 @@ end
 
 vim.api.nvim_set_keymap(
   'n',               -- normal mode
-  '<C-N>',           -- key combination
+  '<leader>n',
+  -- '<C-N>',           -- key combination
   [[:lua CreateEmptyBlockBeforeNextHS()<CR>]], -- command to run
   { noremap = true, silent = true }  -- options
 )
-
-
+vim.keymap.set('n', '<leader>-', '/----------------------------------------------------------------------------------<CR>', { noremap = true, silent = true })
 -- keep track of runs to return good output in ghci
 -- accept multiline input
 -- it starts using a lot of ram with time, so i need to sometimes clear all history 
+-- i can create a tab autocomplete super stupid using the ghci tab
