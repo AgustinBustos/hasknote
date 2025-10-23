@@ -408,6 +408,9 @@ vim.api.nvim_set_keymap(
   { noremap = true, silent = true }  -- options
 )
 vim.keymap.set('n', '<leader>-', '/----------------------------------------------------------------------------------<CR>', { noremap = true, silent = true })
+vim.keymap.set('n', '<leader>y', '"+y', { noremap = true, silent = true })
+vim.keymap.set('v', '<leader>y', '"+y', { noremap = true, silent = true })
+vim.keymap.set('n', '<leader>l', '<C-^>', { noremap = true, silent = true })
 -- keep track of runs to return good output in ghci
 -- accept multiline input
 -- it starts using a lot of ram with time, so i need to sometimes clear all history 
