@@ -408,6 +408,8 @@ vim.api.nvim_set_keymap(
   { noremap = true, silent = true }  -- options
 )
 vim.keymap.set('n', '<leader>-', '/----------------------------------------------------------------------------------<CR>', { noremap = true, silent = true })
+vim.keymap.set('n', '<leader>o', '/--------------------------------------------------------------------HF<CR>', { noremap = true, silent = true })
+
 vim.keymap.set('n', '<leader>y', '"+y', { noremap = true, silent = true })
 vim.keymap.set('v', '<leader>y', '"+y', { noremap = true, silent = true })
 vim.keymap.set('n', '<leader>l', '<C-^>', { noremap = true, silent = true })
