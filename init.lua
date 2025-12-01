@@ -418,21 +418,22 @@ vim.keymap.set('n', '<leader>l', '<C-^>', { noremap = true, silent = true })
 -- it starts using a lot of ram with time, so i need to sometimes clear all history 
 -- i can create a tab autocomplete super stupid using the ghci tab
 
-vim.lsp.config["hls"] = {
-  settings = {
-    haskell = {
-      formattingProvider = "ormolu",
-    },
-  },
-}
+-- vim.lsp.config["hls"] = {
+--   settings = {
+--     haskell = {
+--       formattingProvider = "ormolu",
+--     },
+--   },
+-- }
+-- 
+-- vim.lsp.start(vim.lsp.config["hls"])
+
 require("nvim-treesitter.configs").setup {
   highlight = {
     enable = true,
     additional_vim_regex_highlighting = false
   }
 }
-
-vim.lsp.start(vim.lsp.config["hls"])
 
 vim.opt.termguicolors = true
 vim.cmd [[hi Normal guibg=NONE ctermbg=NONE]]
@@ -465,3 +466,47 @@ vim.api.nvim_set_hl(0, "@comment",  { fg = color8 })
 -- vim.api.nvim_set_hl(0, "Function", { fg = color6 })
 -- vim.api.nvim_set_hl(0, "Type",     { fg = color4 })
 
+-- local lspconfig = require("lspconfig")
+-- 
+-- lspconfig.hls.setup {
+--   settings = {
+--     haskell = {
+--       formattingProvider = "ormolu",
+--     },
+--   },
+-- }
+
+-- local lspconfig = require("lspconfig")
+-- vim.api.nvim_create_autocmd("FileType", {
+--   pattern = "haskell",
+--   callback = function()
+--     lspconfig.hls.setup{
+--       settings = {
+--         haskell = {
+--           formattingProvider = "ormolu",
+--         },
+--       },
+--     }
+--   end,
+-- })
+-- -- Modern LSP API (Neovim 0.10+)
+-- vim.lsp.config["hls"] = {
+--   -- This auto-detects haskell-language-server on PATH
+--   cmd = { "haskell-language-server-wrapper", "--lsp" },
+-- 
+--   root_dir = vim.fs.root(0, { "hie.yaml", "stack.yaml", "cabal.project", "*.cabal" }),
+-- 
+--   settings = {
+--     haskell = {
+--       formattingProvider = "ormolu",
+--     },
+--   },
+-- }
+-- 
+-- -- Auto-start only for Haskell files
+-- vim.api.nvim_create_autocmd("FileType", {
+--   pattern = "haskell",
+--   callback = function()
+--     vim.lsp.start(vim.lsp.config["hls"])
+--   end,
+-- })
