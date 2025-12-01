@@ -417,3 +417,51 @@ vim.keymap.set('n', '<leader>l', '<C-^>', { noremap = true, silent = true })
 -- accept multiline input
 -- it starts using a lot of ram with time, so i need to sometimes clear all history 
 -- i can create a tab autocomplete super stupid using the ghci tab
+
+vim.lsp.config["hls"] = {
+  settings = {
+    haskell = {
+      formattingProvider = "ormolu",
+    },
+  },
+}
+require("nvim-treesitter.configs").setup {
+  highlight = {
+    enable = true,
+    additional_vim_regex_highlighting = false
+  }
+}
+
+vim.lsp.start(vim.lsp.config["hls"])
+
+vim.opt.termguicolors = true
+vim.cmd [[hi Normal guibg=NONE ctermbg=NONE]]
+vim.cmd [[hi NormalFloat guibg=NONE]]
+
+vim.cmd("source ~/.cache/wal/colors-wal.vim")
+
+-- convert pywal colors (color0..color15) into Lua-accessible vim.g.colorN
+for i = 0, 15 do
+  local name = "color" .. i
+  if pcall(vim.api.nvim_get_var, name) then
+    vim.g[name] = vim.api.nvim_get_var(name)
+  end
+end
+-- vim.api.nvim_set_hl(0, "Normal", { bg = "#000000" })  -- your preferred bg
+
+local color2 = vim.g.color2
+local color3 = vim.g.color3
+local color4 = vim.g.color4
+local color6 = vim.g.color6
+local color8 = vim.g.color8
+vim.api.nvim_set_hl(0, "@keyword",  { fg = color2 })
+vim.api.nvim_set_hl(0, "@type",     { fg = color4 })
+vim.api.nvim_set_hl(0, "@function", { fg = color6 })
+vim.api.nvim_set_hl(0, "@string",   { fg = color3 })
+vim.api.nvim_set_hl(0, "@comment",  { fg = color8 })
+-- vim.api.nvim_set_hl(0, "Comment",  { fg = color8 })
+-- vim.api.nvim_set_hl(0, "Keyword",  { fg = color2 })
+-- vim.api.nvim_set_hl(0, "String",   { fg = color3 })
+-- vim.api.nvim_set_hl(0, "Function", { fg = color6 })
+-- vim.api.nvim_set_hl(0, "Type",     { fg = color4 })
+
