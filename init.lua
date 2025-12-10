@@ -305,7 +305,7 @@ function PrintSections()
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   for i = 1, #lines do
     if lines[i]:match("%-%-*HS%#") then
-       local extracted = string.match(lines[i], " (.*)")
+       local extracted = string.match(lines[i], "#(.*)")
        print(extracted)
     end
   end
@@ -420,7 +420,7 @@ vim.api.nvim_set_keymap(
 )
 vim.keymap.set('n', '<leader>-', '/-------------------------------------------------------------------------------------------------------------------------------------------------HS<CR>', { noremap = true, silent = true })
 -- vim.keymap.set('n', '<leader>o', '/--------------------------------------------------------------------HF<CR>', { noremap = true, silent = true })
--- vim.keymap.set('n', '<leader>/', '/-------------------------------------------------------------------------------------------------------------------------------------------------HS---- #', { noremap = true, silent = true })
+vim.keymap.set('n', '<leader>/', ':lua PrintSections()<CR>/-------------------------------------------------------------------------------------------------------------------------------------------------HS# ', { noremap = true, silent = true })
 vim.keymap.set('n', '<leader>s', ':lua PrintSections()<CR>', { noremap = true, silent = true })
 
 vim.keymap.set('n', '<leader>y', '"+y', { noremap = true, silent = true })
