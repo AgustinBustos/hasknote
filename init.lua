@@ -419,8 +419,8 @@ vim.api.nvim_set_keymap(
   { noremap = true, silent = true }  -- options
 )
 vim.keymap.set('n', '<leader>-', '/--------------------------------------------------------------------------------------------------------------------------------------------HS<CR>', { noremap = true, silent = true })
-vim.keymap.set('n', '<leader>o', '/--------------------------------------------------------------------HF<CR>', { noremap = true, silent = true })
-vim.keymap.set('n', '<leader>/', '/--------------------------------------------------------------------------------------------------------------------------------------------HS---- #', { noremap = true, silent = true })
+-- vim.keymap.set('n', '<leader>o', '/--------------------------------------------------------------------HF<CR>', { noremap = true, silent = true })
+-- vim.keymap.set('n', '<leader>/', '/--------------------------------------------------------------------------------------------------------------------------------------------HS---- #', { noremap = true, silent = true })
 vim.keymap.set('n', '<leader>s', ':lua PrintSections()<CR>', { noremap = true, silent = true })
 
 vim.keymap.set('n', '<leader>y', '"+y', { noremap = true, silent = true })
