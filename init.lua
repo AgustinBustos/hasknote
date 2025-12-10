@@ -300,6 +300,17 @@ function YankBlockBetweenMarkers()
   return block
 end
 
+function PrintSections()
+  local bufnr = vim.api.nvim_get_current_buf()
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  for i = 1, #lines do
+    if lines[i]:match("%-%-*HS%-%-%-%- ") then
+       local extracted = string.match(lines[i], " (.*)")
+       print(extracted)
+    end
+  end
+end
+
 function ReplaceHFtoNextHS(replacement_text)
   local bufnr = vim.api.nvim_get_current_buf()
   local cursor = vim.api.nvim_win_get_cursor(0)
@@ -407,8 +418,10 @@ vim.api.nvim_set_keymap(
   [[:lua CreateEmptyBlockBeforeNextHS()<CR>]], -- command to run
   { noremap = true, silent = true }  -- options
 )
-vim.keymap.set('n', '<leader>-', '/----------------------------------------------------------------------------------<CR>', { noremap = true, silent = true })
+vim.keymap.set('n', '<leader>-', '/--------------------------------------------------------------------------------------------------------------------------------------------HS<CR>', { noremap = true, silent = true })
 vim.keymap.set('n', '<leader>o', '/--------------------------------------------------------------------HF<CR>', { noremap = true, silent = true })
+vim.keymap.set('n', '<leader>/', '/--------------------------------------------------------------------------------------------------------------------------------------------HS---- #', { noremap = true, silent = true })
+vim.keymap.set('n', '<leader>s', ':lua PrintSections()<CR>', { noremap = true, silent = true })
 
 vim.keymap.set('n', '<leader>y', '"+y', { noremap = true, silent = true })
 vim.keymap.set('v', '<leader>y', '"+y', { noremap = true, silent = true })
@@ -460,6 +473,9 @@ vim.api.nvim_set_hl(0, "@type",     { fg = color4 })
 vim.api.nvim_set_hl(0, "@function", { fg = color6 })
 vim.api.nvim_set_hl(0, "@string",   { fg = color3 })
 vim.api.nvim_set_hl(0, "@comment",  { fg = color8 })
+
+
+
 -- vim.api.nvim_set_hl(0, "Comment",  { fg = color8 })
 -- vim.api.nvim_set_hl(0, "Keyword",  { fg = color2 })
 -- vim.api.nvim_set_hl(0, "String",   { fg = color3 })
