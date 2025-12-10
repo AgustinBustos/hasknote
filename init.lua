@@ -304,7 +304,7 @@ function PrintSections()
   local bufnr = vim.api.nvim_get_current_buf()
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
   for i = 1, #lines do
-    if lines[i]:match("%-%-*HS%-%-%-%- ") then
+    if lines[i]:match("%-%-*HS%#") then
        local extracted = string.match(lines[i], " (.*)")
        print(extracted)
     end
@@ -403,7 +403,7 @@ function CreateEmptyBlockBeforeNextHS()
   end
 
   local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-  local block = { "--------------------------------------------------------------------------------------------------------------------------------------------HS", "", "--------------------------------------------------------------------HF" }
+  local block = { "-------------------------------------------------------------------------------------------------------------------------------------------------HS", "", "--------------------------------------------------------------------HF" }
 
   vim.api.nvim_buf_set_lines(bufnr, insert_line, insert_line, false, block)
   vim.api.nvim_win_set_cursor(0,{insert_line+2,0})
@@ -418,9 +418,9 @@ vim.api.nvim_set_keymap(
   [[:lua CreateEmptyBlockBeforeNextHS()<CR>]], -- command to run
   { noremap = true, silent = true }  -- options
 )
-vim.keymap.set('n', '<leader>-', '/--------------------------------------------------------------------------------------------------------------------------------------------HS<CR>', { noremap = true, silent = true })
+vim.keymap.set('n', '<leader>-', '/-------------------------------------------------------------------------------------------------------------------------------------------------HS<CR>', { noremap = true, silent = true })
 -- vim.keymap.set('n', '<leader>o', '/--------------------------------------------------------------------HF<CR>', { noremap = true, silent = true })
--- vim.keymap.set('n', '<leader>/', '/--------------------------------------------------------------------------------------------------------------------------------------------HS---- #', { noremap = true, silent = true })
+-- vim.keymap.set('n', '<leader>/', '/-------------------------------------------------------------------------------------------------------------------------------------------------HS---- #', { noremap = true, silent = true })
 vim.keymap.set('n', '<leader>s', ':lua PrintSections()<CR>', { noremap = true, silent = true })
 
 vim.keymap.set('n', '<leader>y', '"+y', { noremap = true, silent = true })
