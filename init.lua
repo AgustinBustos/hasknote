@@ -306,7 +306,8 @@ function PrintSections()
   for i = 1, #lines do
     if lines[i]:match("%-%-*HS%#") then
        local extracted = string.match(lines[i], "#(.*)")
-       print(extracted)
+       local clean = extracted:gsub("#", "  ")
+       print(clean)
     end
   end
 end
