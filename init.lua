@@ -420,8 +420,9 @@ vim.api.nvim_set_keymap(
   { noremap = true, silent = true }  -- options
 )
 vim.keymap.set('n', '<leader>-', '/-------------------------------------------------------------------------------------------------------------------------------------------------HS<CR>', { noremap = true, silent = true })
--- vim.keymap.set('n', '<leader>o', '/--------------------------------------------------------------------HF<CR>', { noremap = true, silent = true })
+vim.keymap.set('n', '<leader>o', '/--------------------------------------------------------------------HF<CR>', { noremap = true, silent = true })
 vim.keymap.set('n', '<leader>/', ':lua PrintSections()<CR>/-------------------------------------------------------------------------------------------------------------------------------------------------HS#* .*', { noremap = true, silent = true })
+-- vim.keymap.set("i", "<C-n>", "<Tab>", { noremap = true })
 -- vim.keymap.set('n', '<leader>s', ':lua PrintSections()<CR>', { noremap = true, silent = true })
 
 vim.keymap.set('n', '<leader>y', '"+y', { noremap = true, silent = true })
@@ -476,54 +477,3 @@ vim.api.nvim_set_hl(0, "@string",   { fg = color3 })
 vim.api.nvim_set_hl(0, "@comment",  { fg = color8 })
 
 
-
--- vim.api.nvim_set_hl(0, "Comment",  { fg = color8 })
--- vim.api.nvim_set_hl(0, "Keyword",  { fg = color2 })
--- vim.api.nvim_set_hl(0, "String",   { fg = color3 })
--- vim.api.nvim_set_hl(0, "Function", { fg = color6 })
--- vim.api.nvim_set_hl(0, "Type",     { fg = color4 })
-
--- local lspconfig = require("lspconfig")
--- 
--- lspconfig.hls.setup {
---   settings = {
---     haskell = {
---       formattingProvider = "ormolu",
---     },
---   },
--- }
-
--- local lspconfig = require("lspconfig")
--- vim.api.nvim_create_autocmd("FileType", {
---   pattern = "haskell",
---   callback = function()
---     lspconfig.hls.setup{
---       settings = {
---         haskell = {
---           formattingProvider = "ormolu",
---         },
---       },
---     }
---   end,
--- })
--- -- Modern LSP API (Neovim 0.10+)
--- vim.lsp.config["hls"] = {
---   -- This auto-detects haskell-language-server on PATH
---   cmd = { "haskell-language-server-wrapper", "--lsp" },
--- 
---   root_dir = vim.fs.root(0, { "hie.yaml", "stack.yaml", "cabal.project", "*.cabal" }),
--- 
---   settings = {
---     haskell = {
---       formattingProvider = "ormolu",
---     },
---   },
--- }
--- 
--- -- Auto-start only for Haskell files
--- vim.api.nvim_create_autocmd("FileType", {
---   pattern = "haskell",
---   callback = function()
---     vim.lsp.start(vim.lsp.config["hls"])
---   end,
--- })
