@@ -411,7 +411,6 @@ function CreateEmptyBlockBeforeNextHS()
 end
 
 
-
 vim.api.nvim_set_keymap(
   'n',               -- normal mode
   '<leader>n',
@@ -428,6 +427,39 @@ vim.keymap.set('n', '<leader>/', ':lua PrintSections()<CR>/---------------------
 vim.keymap.set('n', '<leader>y', '"+y', { noremap = true, silent = true })
 vim.keymap.set('v', '<leader>y', '"+y', { noremap = true, silent = true })
 vim.keymap.set('n', '<leader>l', '<C-^>', { noremap = true, silent = true })
+
+function MarkWithTimestamp()
+  local l = vim.fn.line(".")
+  local ts = os.date("%Y-%m-%d %H:%M")
+
+  local line = vim.fn.getline(l)
+  line = "* " .. line .. " -> " .. ts
+  vim.fn.setline(l, line)
+end
+
+function MarkWithTimestampFinish()
+  local l = vim.fn.line(".")
+  local ts = os.date("%Y-%m-%d %H:%M")
+
+  local line = vim.fn.getline(l)
+  line = "-- " .. line .. " -> " .. ts
+  vim.fn.setline(l, line)
+end
+
+vim.api.nvim_set_keymap(
+  'n',               -- normal mode
+  '<leader>s',
+  -- '<C-N>',           -- key combination
+  [[:lua MarkWithTimestamp()<CR>]], -- command to run
+  { noremap = true, silent = true }  -- options
+)
+vim.api.nvim_set_keymap(
+  'n',               -- normal mode
+  '<leader>f',
+  -- '<C-N>',           -- key combination
+  [[:lua MarkWithTimestampFinish()<CR>]], -- command to run
+  { noremap = true, silent = true }  -- options
+)
 -- keep track of runs to return good output in ghci
 -- accept multiline input
 -- it starts using a lot of ram with time, so i need to sometimes clear all history 
@@ -475,5 +507,6 @@ vim.api.nvim_set_hl(0, "@type",     { fg = color4 })
 vim.api.nvim_set_hl(0, "@function", { fg = color6 })
 vim.api.nvim_set_hl(0, "@string",   { fg = color3 })
 vim.api.nvim_set_hl(0, "@comment",  { fg = color8 })
+
 
 
