@@ -527,21 +527,35 @@ vim.api.nvim_set_hl(0, "@type",     { fg = color4 })
 vim.api.nvim_set_hl(0, "@function", { fg = color6 })
 vim.api.nvim_set_hl(0, "@string",   { fg = color3 })
 vim.api.nvim_set_hl(0, "@comment",  { fg = color8 })
+
 local last_j = 0
 local last_k = 0
+local delay = 1000 -- ms
+
+local function allow_motion(last_time)
+  -- Allow freely during macro recording or execution
+  if vim.fn.reg_recording() ~= "" or vim.fn.reg_executing() ~= "" then
+    return true
+  end
+
+  local now = vim.loop.now()
+  if now - last_time > delay then
+    return true
+  end
+
+  return false
+end
 
 vim.keymap.set('n', 'j', function()
-  local now = vim.loop.now()
-  if now - last_j > 1000 then
+  if allow_motion(last_j) then
+    last_j = vim.loop.now()
     vim.cmd('normal! ' .. vim.v.count1 .. 'j')
   end
-  last_j = now
 end)
 
 vim.keymap.set('n', 'k', function()
-  local now = vim.loop.now()
-  if now - last_k > 1000 then
+  if allow_motion(last_k) then
+    last_k = vim.loop.now()
     vim.cmd('normal! ' .. vim.v.count1 .. 'k')
   end
-  last_k = now
 end)
