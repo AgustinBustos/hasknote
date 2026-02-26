@@ -158,8 +158,10 @@ function YankTerminalOutput(bufnr)
   --count it
   local last_count=_G.ghci_prompt_count
   local count = 0
+
+  local runtime_indicator = getIndicator()
   for _, line in ipairs(lines) do
-    for _ in line:gmatch("ghci>") do
+    for _ in line:gmatch(runtime_indicator) do
       count = count + 1
     end
   end
@@ -172,8 +174,10 @@ function GetNewTerminalOutput(lines, last_count, register)
   local ghci_seen = 0
   local start_line = 0
 
+
+  local runtime_indicator = getIndicator()
   for i, line in ipairs(lines) do
-    for _ in line:gmatch("ghci>") do
+    for _ in line:gmatch(runtime_indicator) do
       ghci_seen = ghci_seen + 1
     end
     if ghci_seen == last_count then
@@ -189,10 +193,25 @@ function GetNewTerminalOutput(lines, last_count, register)
 
   return new_lines
 end
+
+function getIndicator()
+  filename = vim.api.nvim_buf_get_name(0)
+  ext = filename:match("^.+%.(.+)$")
+
+  if ext == "py" then
+    runtime_indicator = ">>> "
+  else
+    runtime_indicator = "ghci>"
+  end
+  return runtime_indicator
+end
+
 function DropGHCiPromptLines(lines)
+  local runtime_indicator = getIndicator()
+
   local result = {}
   for _, line in ipairs(lines) do
-    if not line:match("ghci>") then
+    if not line:match(runtime_indicator) then
       table.insert(result, line)
     end
   end
@@ -510,4 +529,21 @@ vim.api.nvim_set_hl(0, "@string",   { fg = color3 })
 vim.api.nvim_set_hl(0, "@comment",  { fg = color8 })
 
 
+local last_j = 0
+local last_k = 0
 
+vim.keymap.set('n', 'j', function()
+  local now = vim.loop.now()
+  if now - last_j > 1000 then
+    vim.cmd('normal! j')
+  end
+  last_j = now
+end)
+
+vim.keymap.set('n', 'k', function()
+  local now = vim.loop.now()
+  if now - last_k > 1000 then
+    vim.cmd('normal! k')
+  end
+  last_k = now
+end)
