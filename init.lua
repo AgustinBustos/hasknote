@@ -527,15 +527,13 @@ vim.api.nvim_set_hl(0, "@type",     { fg = color4 })
 vim.api.nvim_set_hl(0, "@function", { fg = color6 })
 vim.api.nvim_set_hl(0, "@string",   { fg = color3 })
 vim.api.nvim_set_hl(0, "@comment",  { fg = color8 })
-
-
 local last_j = 0
 local last_k = 0
 
 vim.keymap.set('n', 'j', function()
   local now = vim.loop.now()
   if now - last_j > 1000 then
-    vim.cmd('normal! j')
+    vim.cmd('normal! ' .. vim.v.count1 .. 'j')
   end
   last_j = now
 end)
@@ -543,7 +541,7 @@ end)
 vim.keymap.set('n', 'k', function()
   local now = vim.loop.now()
   if now - last_k > 1000 then
-    vim.cmd('normal! k')
+    vim.cmd('normal! ' .. vim.v.count1 .. 'k')
   end
   last_k = now
 end)
