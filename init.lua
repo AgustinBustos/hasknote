@@ -494,14 +494,14 @@ end
 
 vim.api.nvim_set_keymap(
 	"n", -- normal mode
-	"<leader>s",
+	"<leader>z",
 	-- '<C-N>',           -- key combination
 	[[:lua MarkWithTimestamp()<CR>]], -- command to run
 	{ noremap = true, silent = true } -- options
 )
 vim.api.nvim_set_keymap(
 	"n", -- normal mode
-	"<leader>f",
+	"<leader>x",
 	-- '<C-N>',           -- key combination
 	[[:lua MarkWithTimestampFinish()<CR>]], -- command to run
 	{ noremap = true, silent = true } -- options
@@ -549,37 +549,105 @@ vim.api.nvim_set_hl(0, "@function", { fg = color6 })
 vim.api.nvim_set_hl(0, "@string", { fg = color3 })
 vim.api.nvim_set_hl(0, "@comment", { fg = color8 })
 
-local last_j = 0
-local last_k = 0
-local delay = 1000 -- ms
+-- local last_j = 0
+-- local last_k = 0
+-- local delay = 1000 -- ms
+--
+-- local function allow_motion(last_time)
+-- 	-- Allow freely during macro recording or execution
+-- 	if vim.fn.reg_recording() ~= "" or vim.fn.reg_executing() ~= "" then
+-- 		return true
+-- 	end
+--
+-- 	local now = vim.loop.now()
+-- 	if now - last_time > delay then
+-- 		return true
+-- 	end
+--
+-- 	return false
+-- end
+--
+-- vim.keymap.set("n", "j", function()
+-- 	if allow_motion(last_j) then
+-- 		last_j = vim.loop.now()
+-- 		vim.cmd("normal! " .. vim.v.count1 .. "j")
+-- 	end
+-- end)
+--
+-- vim.keymap.set("n", "k", function()
+-- 	if allow_motion(last_k) then
+-- 		last_k = vim.loop.now()
+-- 		vim.cmd("normal! " .. vim.v.count1 .. "k")
+-- 	end
+-- end)
 
-local function allow_motion(last_time)
-	-- Allow freely during macro recording or execution
-	if vim.fn.reg_recording() ~= "" or vim.fn.reg_executing() ~= "" then
-		return true
+-- Vertical "find": like f<char> but across lines.
+-- Reads one char, then jumps to the first word on a *different* line (scanning
+-- in the given direction) that starts with that char, landing on that word.
+-- <leader>d = downward, <leader>u = upward. ; repeats, , repeats reversed.
+local last_vf = nil -- { ch = <char>, dir = 1 or -1 }
+
+-- All 0-indexed columns of word-starts on `line` matching `ch`, left to right.
+local function vf_word_cols(line, ch)
+	local cols = {}
+	for p = 1, #line do
+		if line:sub(p, p) == ch then
+			local prev = p > 1 and line:sub(p - 1, p - 1) or ""
+			if not prev:match("[%w_]") then -- ch begins a word/token
+				cols[#cols + 1] = p - 1
+			end
+		end
 	end
-
-	local now = vim.loop.now()
-	if now - last_time > delay then
-		return true
-	end
-
-	return false
+	return cols
 end
 
-vim.keymap.set("n", "j", function()
-	if allow_motion(last_j) then
-		last_j = vim.loop.now()
-		vim.cmd("normal! " .. vim.v.count1 .. "j")
+-- Jump to the next word-start matching `ch` after the cursor (dir 1) or before
+-- it (dir -1). Walks within a line too, so multiple matches per line are all
+-- reachable (e.g. both p-words in "profile performance").
+local function vf_exec(ch, dir)
+	local cur = vim.api.nvim_win_get_cursor(0)
+	local row, col = cur[1], cur[2]
+	local last = vim.api.nvim_buf_line_count(0)
+	for i = row, (dir > 0 and last or 1), dir do
+		local cols = vf_word_cols(vim.fn.getline(i), ch)
+		if dir > 0 then
+			for _, c in ipairs(cols) do
+				if i > row or c > col then
+					vim.api.nvim_win_set_cursor(0, { i, c })
+					return
+				end
+			end
+		else
+			for j = #cols, 1, -1 do
+				local c = cols[j]
+				if i < row or c < col then
+					vim.api.nvim_win_set_cursor(0, { i, c })
+					return
+				end
+			end
+		end
 	end
+end
+
+local function vertical_find(dir)
+	local ch = vim.fn.getcharstr()
+	if ch == "" or ch == "\27" then return end -- empty / <Esc> cancels
+	last_vf = { ch = ch, dir = dir }
+	vf_exec(ch, dir)
+end
+
+vim.keymap.set("n", "<leader>d", function() vertical_find(1) end)
+vim.keymap.set("n", "<leader>u", function() vertical_find(-1) end)
+
+-- Repeat the last vertical find. NOTE: this overrides the native ; and ,
+-- (which repeat horizontal f/t/F/T).
+vim.keymap.set("n", ";", function()
+	if last_vf then vf_exec(last_vf.ch, last_vf.dir) end
+end)
+vim.keymap.set("n", ",", function()
+	if last_vf then vf_exec(last_vf.ch, -last_vf.dir) end
 end)
 
-vim.keymap.set("n", "k", function()
-	if allow_motion(last_k) then
-		last_k = vim.loop.now()
-		vim.cmd("normal! " .. vim.v.count1 .. "k")
-	end
-end)
 vim.filetype.add({
   extension = {
     todo = "mytodo",  -- or sg if you prefer
