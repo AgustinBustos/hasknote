@@ -584,7 +584,7 @@ vim.api.nvim_set_hl(0, "@comment", { fg = color8 })
 -- Vertical "find": like f<char> but across lines.
 -- Reads one char, then jumps to the first word on a *different* line (scanning
 -- in the given direction) that starts with that char, landing on that word.
--- <leader>d = downward, <leader>u = upward. ; repeats, , repeats reversed.
+-- <leader>d = downward, <leader>u = upward. n repeats, N repeats reversed.
 local last_vf = nil -- { ch = <char>, dir = 1 or -1 }
 
 -- All 0-indexed columns of word-starts on `line` matching `ch`, left to right.
@@ -639,12 +639,12 @@ end
 vim.keymap.set("n", "<leader>d", function() vertical_find(1) end)
 vim.keymap.set("n", "<leader>u", function() vertical_find(-1) end)
 
--- Repeat the last vertical find. NOTE: this overrides the native ; and ,
--- (which repeat horizontal f/t/F/T).
-vim.keymap.set("n", ";", function()
+-- Repeat the last vertical find. NOTE: this overrides the native n and N
+-- (which repeat search). n repeats forward, N repeats reversed.
+vim.keymap.set("n", "n", function()
 	if last_vf then vf_exec(last_vf.ch, last_vf.dir) end
 end)
-vim.keymap.set("n", ",", function()
+vim.keymap.set("n", "N", function()
 	if last_vf then vf_exec(last_vf.ch, -last_vf.dir) end
 end)
 
