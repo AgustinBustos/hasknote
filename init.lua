@@ -639,14 +639,25 @@ end
 vim.keymap.set("n", "<leader>d", function() vertical_find(1) end)
 vim.keymap.set("n", "<leader>u", function() vertical_find(-1) end)
 
--- Repeat the last vertical find. NOTE: this overrides the native n and N
--- (which repeat search). n repeats forward, N repeats reversed.
+-- Repeat the last vertical find with n / N. These coexist with the native
+-- n / N (repeat search): they only take over while a vertical find is the
+-- most recent motion; otherwise they fall through to normal search-repeat.
+-- Starting any search (/ ? * #) clears last_vf so search takes back over.
 vim.keymap.set("n", "n", function()
-	if last_vf then vf_exec(last_vf.ch, last_vf.dir) end
+	if last_vf then vf_exec(last_vf.ch, last_vf.dir)
+	else vim.cmd("normal! n") end
 end)
 vim.keymap.set("n", "N", function()
-	if last_vf then vf_exec(last_vf.ch, -last_vf.dir) end
+	if last_vf then vf_exec(last_vf.ch, -last_vf.dir)
+	else vim.cmd("normal! N") end
 end)
+
+for _, key in ipairs({ "/", "?", "*", "#" }) do
+	vim.keymap.set("n", key, function()
+		last_vf = nil
+		return key
+	end, { expr = true })
+end
 
 vim.filetype.add({
   extension = {
