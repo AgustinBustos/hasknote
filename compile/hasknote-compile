@@ -1038,6 +1038,7 @@ PAGE_JS = r"""
       const traces = !isPrint ? c.traces : c.traces.map(t => Object.assign({}, t,
         {line: Object.assign({width: c.panel ? 1.1 : 1.3}, t.line || {})}));
       await Plotly.newPlot(el, traces, layout, config);
+      if (!isPrint) addFullscreen(el, c);
     } else if (c.type === "vega") {
       if (typeof vegaEmbed === "undefined") { el.outerHTML = '<div class="chart-missing">vega-embed could not be loaded</div>'; return; }
       const spec = Object.assign({}, c.spec);
@@ -1046,8 +1047,58 @@ PAGE_JS = r"""
       spec.autosize = {type: "fit", contains: "padding"};
       await vegaEmbed(el, spec, {renderer: "svg", actions: !isPrint,
         config: {font: "LM Roman 10", view: {stroke: "#222"}}});
+      if (!isPrint) addFullscreen(el, c);
     }
   }
+  // Full-screen button on every chart (HTML only). Uses the Fullscreen API when
+  // available and falls back to a fixed overlay (e.g. iPhone Safari); Esc or the
+  // button again closes it. The chart is resized to fill the screen.
+  const ICON_OPEN = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
+  const ICON_CLOSE = '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M6 2v4H2M14 6h-4V2M10 14v-4h4M2 10h4v4" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>';
+  function refit(wrap) {
+    const el = wrap.querySelector(".chart"), c = wrap._chart;
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      if (c.type === "plotly" && el.data) Plotly.Plots.resize(el);
+      else if (c.type === "vega") draw(c).catch(e => console.error(e));
+    }));
+  }
+  function setFull(wrap, on) {
+    wrap.classList.toggle("is-full", on);
+    document.body.classList.toggle("has-full-chart", on);
+    const b = wrap.querySelector(".fs-btn");
+    b.innerHTML = on ? ICON_CLOSE : ICON_OPEN;
+    b.title = on ? "Exit full screen (Esc)" : "Full screen";
+    b.setAttribute("aria-label", b.title);
+    refit(wrap);
+  }
+  function addFullscreen(el, c) {
+    if (el.parentNode.classList.contains("chart-wrap")) return;  // vega redraw
+    const wrap = document.createElement("div");
+    wrap.className = "chart-wrap"; wrap._chart = c;
+    el.parentNode.insertBefore(wrap, el); wrap.appendChild(el);
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "fs-btn"; b.innerHTML = ICON_OPEN;
+    b.title = "Full screen"; b.setAttribute("aria-label", "Full screen");
+    wrap.appendChild(b);
+    b.addEventListener("click", () => {
+      const on = !wrap.classList.contains("is-full");
+      if (on) {
+        setFull(wrap, true);
+        if (wrap.requestFullscreen) wrap.requestFullscreen().catch(() => {});
+      } else {
+        if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+        setFull(wrap, false);
+      }
+    });
+  }
+  document.addEventListener("fullscreenchange", () => {
+    if (!document.fullscreenElement)
+      document.querySelectorAll(".chart-wrap.is-full").forEach(w => setFull(w, false));
+  });
+  document.addEventListener("keydown", e => {
+    if (e.key === "Escape")
+      document.querySelectorAll(".chart-wrap.is-full").forEach(w => setFull(w, false));
+  });
   const ready = document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve();
   ready.then(() => Promise.all(H.charts.map(c => draw(c).catch(e => console.error(e)))))
        .then(() => { window.HASKNOTE_DONE = true; document.body.dataset.done = "1"; });

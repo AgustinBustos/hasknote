@@ -380,3 +380,27 @@ main.snippet { padding: 16px; }
 main.snippet .sec .secnum { display: none; }
 main.snippet h2.sec:first-child, main.snippet h3.sec:first-child, main.snippet h4.sec:first-child { margin-top: 0; }
 main.snippet > :last-child { margin-bottom: 0; }
+
+/* ---- full-screen button on charts (HTML only) ------------------------------ */
+.chart-wrap { position: relative; }
+.fs-btn {
+  position: absolute; top: 6px; right: 6px; z-index: 5;
+  width: 28px; height: 28px; padding: 0;
+  display: grid; place-items: center;
+  border: 1px solid var(--rule); border-radius: 4px;
+  background: rgba(255, 255, 255, 0.92); color: var(--ink-2);
+  cursor: pointer; opacity: 0.6; transition: opacity 0.15s;
+}
+.chart-wrap:hover .fs-btn, .fs-btn:focus-visible { opacity: 1; }
+.fs-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* keep Plotly's own toolbar clear of the button */
+.chart-wrap .modebar-container .modebar { right: 40px !important; }
+.chart-wrap.is-full {
+  position: fixed; inset: 0; z-index: 1000;
+  display: flex; flex-direction: column;
+  padding: 28px 24px 20px; background: var(--page);
+}
+.chart-wrap.is-full .chart { flex: 1; width: 100%; height: auto; aspect-ratio: auto; min-height: 0; }
+.chart-wrap.is-full .fs-btn { top: 12px; right: 12px; opacity: 1; }
+body.has-full-chart { overflow: hidden; }
+@media print { .fs-btn { display: none !important; } }
