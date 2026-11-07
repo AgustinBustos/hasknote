@@ -1,0 +1,2 @@
+Install / reinstall after editing Hasknote.hs:  cabal install --lib --force-reinstalls .
+(~/.config/cabal/config is set to dynamic-only builds, as Arch GHC needs)

@@ -1,0 +1,1448 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#   "pygments>=2.17",
+#   "markdown-it-py>=3.0",
+#   "mdit-py-plugins>=0.4",
+#   "fonttools[woff]>=4.50",
+#   "pillow>=10",
+# ]
+# ///
+"""hasknote-compile: turn a hasknote Haskell notebook (.hs) into a typeset
+HTML document (interactive Plotly charts) and a PDF (vector charts).
+
+Notebook format
+    ----...----HS[# Title]   start of a cell (HS## = subsection, ...)
+    <GHCi input>
+    ----...----HF            end of input; captured GHCi output follows
+    <output, may contain "[html] path.html <ts>" / "[plot] path.vl.json">
+
+See README.md next to this script.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import copy
+import datetime as dt
+import hashlib
+import html
+import json
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+from pygments.lexers import HaskellLexer
+from pygments.token import STANDARD_TYPES
+
+HERE = Path(__file__).resolve().parent
+CSS_FILE = HERE / "hasknote.css"
+CACHE = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "hasknote" / "compile"
+
+PLOTLY_VERSION = "2.35.2"
+PLOTLY_CDN = f"https://cdn.jsdelivr.net/npm/plotly.js-dist-min@{PLOTLY_VERSION}/plotly.min.js"
+VEGA_CDN = [
+    "https://cdn.jsdelivr.net/npm/vega@5.30.0/build/vega.min.js",
+    "https://cdn.jsdelivr.net/npm/vega-lite@5.21.0/build/vega-lite.min.js",
+    "https://cdn.jsdelivr.net/npm/vega-embed@6.26.0/build/vega-embed.min.js",
+]
+KATEX_VERSION = "0.16.11"
+KATEX_TGZ = f"https://registry.npmjs.org/katex/-/katex-{KATEX_VERSION}.tgz"
+LM_ZIP = "https://www.gust.org.pl/projects/e-foundry/latin-modern/download/lm2.004otf.zip"
+LM_FALLBACK = "https://mirrors.ctan.org/fonts/lm/fonts/opentype/public/lm/{name}"
+# Latin Modern (the LaTeX font) families used by the stylesheet:
+# (css family, weight, style, file in the GUST zip)
+LM_FACES = [
+    ("LM Roman 10", 400, "normal", "lmroman10-regular.otf"),
+    ("LM Roman 10", 400, "italic", "lmroman10-italic.otf"),
+    ("LM Roman 10", 700, "normal", "lmroman10-bold.otf"),
+    ("LM Roman 10", 700, "italic", "lmroman10-bolditalic.otf"),
+    ("LM Roman 12", 400, "normal", "lmroman12-regular.otf"),
+    ("LM Roman 12", 700, "normal", "lmroman12-bold.otf"),
+    ("LM Roman 12", 400, "italic", "lmroman12-italic.otf"),
+    ("LM Roman 17", 400, "normal", "lmroman17-regular.otf"),
+    ("LM Roman Caps 10", 400, "normal", "lmromancaps10-regular.otf"),
+]
+# Code font: a locally installed Nerd Font (FiraCode: Haskell ligatures such as -> <- :: <> ==).
+CODE_FACES = [
+    ("Hasknote Code", 400, "normal", ["FiraCode Nerd Font:style=Regular", "JetBrainsMono Nerd Font:style=Regular",
+                                      "CaskaydiaMono Nerd Font:style=Regular"]),
+    ("Hasknote Code", 600, "normal", ["FiraCode Nerd Font:style=SemiBold", "JetBrainsMono Nerd Font:style=Bold",
+                                      "CaskaydiaMono Nerd Font:style=Bold"]),
+]
+# Subset for the HTML: Latin, punctuation, arrows, math operators, super/subscripts.
+SUBSET_UNICODES = ("U+0020-007E,U+00A0-017F,U+0192,U+02C6-02DD,U+0391-03C9,U+2010-205E,U+2070-209F,"
+                   "U+2190-21FF,U+2200-22FF,U+2308-230B,U+25A0-25FF,U+27E8-27EB,U+FB00-FB04")
+BODY_FONT = "'LM Roman 10', 'Latin Modern Roman', 'CMU Serif', 'Computer Modern', serif"
+
+# A4 text block for the PDF: 210mm - 2*22mm = 166mm = ~627 CSS px.
+PRINT_TEXT_WIDTH_PX = 627
+LONG_CODE_LINES = 26  # longer code blocks may split across PDF pages
+
+HS_RE = re.compile(r"^-{2,}HS(#*)\s*(.*?)\s*$")
+HF_RE = re.compile(r"^-{2,}HF\s*$")
+MS_RE = re.compile(r"^-{2,}MS\s*$")
+MF_RE = re.compile(r"^-{2,}MF\s*$")
+MARKER_START_RE = re.compile(r"^\[(html|plot)\]\s")
+MARKER_RE = re.compile(r"^\[(html|plot)\]\s+(\S+?\.(?:html?|json))(?:\s+\d+)?\s*$")
+CODEY_RE = re.compile(r"(<-|->|=|::|\s\$\s|<>|\(\w|\[\w|\\\w|^\s*(import|let|where)\b)")
+SETUP_RE = re.compile(r"^\s*(:set|:seti|:add|:load|:l\s|:module|:m\s|:cd|import\s|default\s*\()")
+NOISE_RE = re.compile(
+    r"^\s*(\[\s*\d+ of \d+\] Compiling .*|Ok, (\w+|\d+) modules? loaded\.|Ok, modules loaded:.*"
+    r"|Loaded GHCi configuration from .*|Loaded package environment from .*|Leaving GHCi\.|ghci>\s*)$")
+DIRECTIVE_RE = re.compile(r"^--\s*(title|subtitle|author|date)\s*:\s*(.*?)\s*$", re.I)
+
+
+# --------------------------------------------------------------------------
+# Notebook parsing
+
+
+@dataclass
+class Chart:
+    path: str
+    kind: str  # "html" | "plot"
+
+
+@dataclass
+class Cell:
+    kind: str = "code"  # "code" | "md"
+    md: list[str] = field(default_factory=list)
+    level: int = 0  # 0 = no heading; 1 = HS#, 2 = HS##, ...
+    title: str = ""
+    code: list[str] = field(default_factory=list)
+    output: list[str] = field(default_factory=list)
+
+
+def parse_notebook(text: str) -> list[Cell]:
+    cells: list[Cell] = []
+    cur: Cell | None = None
+    in_output = False
+    in_md = False      # inside an MS cell
+    skipping = False   # between MF and the next HS/MS (editor preview lines)
+    for line in text.splitlines():
+        if MS_RE.match(line):
+            cur = Cell(kind="md")
+            cells.append(cur)
+            in_md, skipping, in_output = True, False, False
+            continue
+        if in_md and MF_RE.match(line):
+            in_md, skipping = False, True
+            continue
+        if in_md:
+            cur.md.append(line.rstrip())
+            continue
+        m = HS_RE.match(line)
+        if m:
+            skipping = False
+            title = m.group(2).strip("# ").strip()
+            cur = Cell(level=len(m.group(1)) if title else 0, title=title)
+            cells.append(cur)
+            in_output = False
+            continue
+        if skipping:
+            continue
+        if HF_RE.match(line):
+            if cur is None:
+                cur = Cell()
+                cells.append(cur)
+            in_output = True
+            continue
+        if cur is None:  # preamble before the first HS
+            if not line.strip():
+                continue
+            cur = Cell()
+            cells.append(cur)
+        (cur.output if in_output else cur.code).append(line.rstrip())
+    return cells
+
+
+def tidy_lines(lines: list[str]) -> list[str]:
+    """Strip leading/trailing blank lines and collapse runs of blanks to one."""
+    out: list[str] = []
+    for ln in lines:
+        if not ln.strip():
+            if out and out[-1] != "":
+                out.append("")
+        else:
+            out.append(ln)
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
+def take_directives(cells: list[Cell]) -> dict:
+    """`-- title: ...`, `-- subtitle:`, `-- author:`, `-- date:` comment lines at the
+    top of the first non-empty cell set the title block (and are removed)."""
+    meta: dict = {}
+    for cell in cells:
+        if not any(l.strip() for l in cell.code):
+            continue
+        keep = []
+        header = True
+        for ln in cell.code:
+            m = DIRECTIVE_RE.match(ln.strip()) if header else None
+            if m:
+                meta[m.group(1).lower()] = m.group(2)
+                continue
+            if ln.strip() and not ln.strip().startswith("--"):
+                header = False
+            keep.append(ln)
+        cell.code = keep
+        break
+    return meta
+
+
+def split_prose(code: list[str]) -> tuple[list[str], list[str]]:
+    """Leading `--` comment lines that read like prose become text above the code.
+    Stops at the first non-comment line or at a comment that looks like code."""
+    prose: list[str] = []
+    i = 0
+    while i < len(code):
+        ln = code[i].strip()
+        if not ln:
+            if prose and prose[-1] != "":
+                prose.append("")
+            i += 1
+            continue
+        m = re.match(r"^--(?![-!#$%&*+./<=>?@\\^|~:])\s?(.*)$", ln)
+        plain = re.sub(r"\$[^$]+\$|`[^`]+`", "", m.group(1)) if m else ""
+        if not m or CODEY_RE.search(plain) or m.group(1).lstrip().startswith("|"):
+            break
+        prose.append(m.group(1).strip())
+        i += 1
+    return tidy_lines(prose), tidy_lines(code[i:])
+
+
+def is_setup(code: list[str]) -> bool:
+    lines = [l for l in code if l.strip() and not l.strip().startswith("--")]
+    return bool(lines) and all(SETUP_RE.match(l) for l in lines)
+
+
+def _depth(s: str) -> int:
+    d = 0
+    in_str = False
+    prev = ""
+    for ch in s:
+        if in_str:
+            if ch == '"' and prev != "\\":
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "([{":
+            d += 1
+        elif ch in ")]}":
+            d -= 1
+        prev = ch
+    return d
+
+
+def rejoin_wrapped(lines: list[str], min_len: int = 70) -> list[str]:
+    """Undo hard wraps the terminal put into captured output: join a line with the
+    previous one when the previous is long and either brackets are still open or
+    the break falls in the middle of a token. Deliberate continuation lines (like
+    hmatrix rows) start with whitespace and are left alone."""
+    out: list[str] = []
+    depth = 0
+    for ln in lines:
+        if out and ln and not ln[0].isspace() and len(out[-1]) >= min_len:
+            prev = out[-1]
+            mid_token = prev[-1:].isalnum() and ln[:1].isalnum()
+            if depth > 0 or mid_token:
+                out[-1] = prev + ln
+                depth += _depth(ln)
+                continue
+        out.append(ln)
+        depth += _depth(ln)
+        if depth < 0:
+            depth = 0
+    return out
+
+
+def split_output(lines: list[str]) -> list[str | Chart]:
+    """Output lines -> sequence of text blocks and Chart markers (in order)."""
+    segs: list[str | Chart] = []
+    buf: list[str] = []
+
+    def flush():
+        t = "\n".join(tidy_lines(rejoin_wrapped(buf)))
+        if t.strip():
+            segs.append(t)
+        buf.clear()
+
+    i = 0
+    while i < len(lines):
+        ln = lines[i].strip()
+        if NOISE_RE.match(lines[i]):
+            i += 1
+            continue
+        if MARKER_START_RE.match(ln):
+            m = MARKER_RE.match(ln)
+            used = 1
+            if not m and i + 1 < len(lines):  # marker wrapped by the terminal
+                m = MARKER_RE.match(ln + lines[i + 1].strip())
+                used = 2
+            if m:
+                flush()
+                segs.append(Chart(path=m.group(2), kind=m.group(1)))
+                i += used
+                continue
+        buf.append(lines[i])
+        i += 1
+    flush()
+    return segs
+
+
+# --------------------------------------------------------------------------
+# GHCi output values: a small parser for `show` output of numbers, strings,
+# tuples, lists and hmatrix matrices ("(3><3)\n [ a, b, c\n , ... ]").
+
+TOKEN_RE = re.compile(r"""
+    (?P<ws>\s+)
+  | (?P<dim>\(\s*\d+\s*><\s*\d+\s*\))
+  | (?P<num>-?(?:\d+\.?\d*(?:[eE][-+]?\d+)?|Infinity|NaN))
+  | (?P<str>"(?:\\.|[^"\\])*")
+  | (?P<punct>[()\[\],])
+  | (?P<other>.)
+""", re.X | re.S)
+
+
+class ParseError(Exception):
+    pass
+
+
+@dataclass
+class Num:
+    raw: str
+
+    @property
+    def value(self) -> float:
+        return float(self.raw.replace("Infinity", "inf").replace("NaN", "nan"))
+
+
+@dataclass
+class Str:
+    text: str
+
+
+@dataclass
+class Tup:
+    items: list
+
+
+@dataclass
+class Lst:
+    items: list
+
+
+@dataclass
+class Mat:
+    rows: int
+    cols: int
+    data: list  # list[Num], row-major
+
+
+def tokenize(s: str) -> list[tuple[str, str, int]]:
+    toks = []
+    for m in TOKEN_RE.finditer(s):
+        kind = m.lastgroup
+        if kind == "ws":
+            continue
+        toks.append((kind, m.group(), m.start()))
+    return toks
+
+
+class ValueParser:
+    def __init__(self, text: str):
+        self.text = text
+        self.toks = tokenize(text)
+        self.i = 0
+
+    def peek(self):
+        return self.toks[self.i] if self.i < len(self.toks) else (None, None, len(self.text))
+
+    def next(self):
+        t = self.peek()
+        self.i += 1
+        return t
+
+    def expect(self, v):
+        t = self.next()
+        if t[1] != v:
+            raise ParseError(v)
+
+    def value(self):
+        kind, v, _ = self.next()
+        if kind == "num":
+            return Num(v)
+        if kind == "str":
+            try:
+                return Str(json.loads(v))
+            except json.JSONDecodeError:
+                return Str(v[1:-1])
+        if kind == "dim":
+            r, c = (int(x) for x in re.findall(r"\d+", v))
+            lst = self.value()
+            if not isinstance(lst, Lst) or len(lst.items) != r * c or not all(isinstance(x, Num) for x in lst.items):
+                raise ParseError("matrix")
+            return Mat(r, c, lst.items)
+        if v == "(":
+            items = [self.value()]
+            while self.peek()[1] == ",":
+                self.next()
+                items.append(self.value())
+            self.expect(")")
+            return items[0] if len(items) == 1 else Tup(items)
+        if v == "[":
+            items = []
+            if self.peek()[1] != "]":
+                items.append(self.value())
+                while self.peek()[1] == ",":
+                    self.next()
+                    items.append(self.value())
+            self.expect("]")
+            return Lst(items)
+        raise ParseError(v)
+
+    def top(self) -> tuple[list, str]:
+        """Parse as many top-level values as possible; return them plus the
+        unparsed remainder (raw text, possibly empty)."""
+        vals = []
+        while self.peek()[0] is not None:
+            start = self.i
+            try:
+                vals.append(self.value())
+            except (ParseError, IndexError, ValueError):
+                self.i = start
+                break
+        return vals, self.text[self.peek()[2]:].strip() if self.peek()[0] is not None else ""
+
+
+def fmt_num(x: float, sig: int = 4) -> str:
+    """Rounded number for display; tiny values (|x| < 1e-12) are 0."""
+    if math.isnan(x):
+        return "NaN"
+    if math.isinf(x):
+        return "∞" if x > 0 else "−∞"
+    if abs(x) < 1e-12:
+        return "0"
+    ax = abs(x)
+    if 1e-4 <= ax < 1e6:
+        s = f"{x:.{sig}g}"
+        if "e" in s:  # e.g. 1.235e+05
+            s = f"{x:.0f}"
+    else:
+        mant, exp = f"{x:.{sig - 1}e}".split("e")
+        mant = mant.rstrip("0").rstrip(".")
+        sup = str(int(exp)).translate(str.maketrans("-0123456789", "⁻⁰¹²³⁴⁵⁶⁷⁸⁹"))
+        s = f"{mant}×10{sup}"
+    return s.replace("-", "−")
+
+
+def fmt_fixed(x: float, dec: int = 3) -> str:
+    if abs(x) < 0.5 * 10 ** (-dec):
+        x = 0.0
+    return f"{x:.{dec}f}".replace("-", "−")
+
+
+def is_num_tree(v) -> bool:
+    return isinstance(v, Num) or (isinstance(v, Tup) and all(isinstance(x, Num) for x in v.items))
+
+
+def shape(v):
+    return "n" if isinstance(v, Num) else tuple(shape(x) for x in v.items)
+
+
+def table_rows(vals: list) -> bool:
+    """Lines like ("Name",(x,y),(z,w)) with a common shape -> a table."""
+    if len(vals) < 2:
+        return False
+    if not all(isinstance(v, Tup) and isinstance(v.items[0], Str) and len(v.items) >= 2
+               and all(is_num_tree(x) for x in v.items[1:]) for v in vals):
+        return False
+    return len({tuple(shape(x) for x in v.items[1:]) for v in vals}) == 1
+
+
+# --------------------------------------------------------------------------
+# Charts
+
+
+def academic_template(font_size: int) -> dict:
+    axis = {
+        "automargin": True, "showline": True, "linecolor": "#222", "linewidth": 0.8,
+        "mirror": True, "ticks": "outside", "tickcolor": "#222", "ticklen": 4,
+        "tickwidth": 0.8, "showgrid": True, "gridcolor": "#eceef2", "gridwidth": 0.6,
+        "zeroline": True, "zerolinecolor": "#aeb4bf", "zerolinewidth": 0.8,
+        "title": {"standoff": 6},
+    }
+    return {
+        "data": {"scatter": [{"line": {"width": 1.5}}]},
+        "layout": {
+            "font": {"family": BODY_FONT, "size": font_size, "color": "#1a1a1a"},
+            "paper_bgcolor": "#ffffff", "plot_bgcolor": "#ffffff",
+            "xaxis": axis, "yaxis": copy.deepcopy(axis),
+            "legend": {"bgcolor": "rgba(255,255,255,0.85)", "bordercolor": "#d0d5dd", "borderwidth": 0},
+            "colorway": ["#332288", "#CC6677", "#44AA99", "#DDCC77", "#882255",
+                         "#88CCEE", "#117733", "#999933", "#AA4499"],
+            "hoverlabel": {"font": {"family": BODY_FONT}},
+        },
+    }
+
+
+def load_chart(ch: Chart, nb_dir: Path) -> dict:
+    """Returns {"type": "plotly"|"vega"|"iframe"|"missing", ...}."""
+    p = Path(ch.path).expanduser()
+    if not p.is_absolute():
+        p = nb_dir / p
+    try:
+        src = p.read_text(encoding="utf-8")
+    except OSError:
+        return {"type": "missing", "path": ch.path}
+    if ch.kind == "plot" or p.suffix == ".json":
+        try:
+            return {"type": "vega", "spec": json.loads(src)}
+        except json.JSONDecodeError:
+            return {"type": "missing", "path": ch.path}
+    m = re.search(r"Plotly\.(?:newPlot|react)\(\s*(?:\"[^\"]*\"|'[^']*'|[\w.$]+)\s*,\s*", src)
+    if m:
+        dec = json.JSONDecoder()
+        try:
+            traces, end = dec.raw_decode(src, m.end())
+            rest = src[end:]
+            m2 = re.match(r"\s*,\s*", rest)
+            layout = dec.raw_decode(rest, m2.end())[0] if m2 else {}
+            if isinstance(traces, list) and isinstance(layout, dict):
+                return {"type": "plotly", "traces": traces, "layout": layout}
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {"type": "iframe", "html": src}
+
+
+def chart_title(spec: dict) -> str:
+    if spec["type"] == "plotly":
+        t = spec["layout"].get("title")
+        t = t.get("text", "") if isinstance(t, dict) else (t or "")
+        return re.sub(r"<[^>]+>", "", str(t)).strip()
+    if spec["type"] == "vega":
+        t = spec["spec"].get("title", "")
+        return (t.get("text", "") if isinstance(t, dict) else str(t)).strip()
+    return ""
+
+
+def series_label(spec: dict) -> str:
+    if spec["type"] != "plotly":
+        return ""
+    names = list(dict.fromkeys(str(t.get("name")) for t in spec["traces"] if t.get("name")))
+    if not names:
+        return ""
+    label = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1]
+    xt = spec["layout"].get("xaxis", {}).get("title", {})
+    xt = xt.get("text", "") if isinstance(xt, dict) else str(xt or "")
+    return f"{label} against {xt}" if xt else label
+
+
+def prepare_plotly(spec: dict, panel: bool, keep_style: bool) -> dict:
+    lay = copy.deepcopy(spec["layout"])
+    for k in ("title", "width", "height"):
+        lay.pop(k, None)
+    if not keep_style:
+        lay["template"] = academic_template(12 if panel else 13)
+        lay.pop("font", None)
+    multi = sum(1 for t in spec["traces"] if t.get("showlegend", True) is not False) > 1
+    lay["margin"] = {"l": 6, "r": 8, "t": 30 if multi else 10, "b": 6, "pad": 0}
+    if multi and "x" not in (spec["layout"].get("legend") or {}):
+        lay["legend"] = {"orientation": "h", "x": 0, "xanchor": "left", "y": 1.0, "yanchor": "bottom",
+                         "borderwidth": 0, "bgcolor": "rgba(0,0,0,0)", "itemwidth": 30}
+    yt = lay.get("yaxis", {}).get("title")
+    if isinstance(yt, dict) and yt.get("text") == "value":
+        yt["text"] = ""
+    return {"traces": spec["traces"], "layout": lay}
+
+
+# --------------------------------------------------------------------------
+# Rendering helpers
+
+
+def _css_class(ttype) -> str:
+    while ttype not in STANDARD_TYPES:
+        ttype = ttype.parent
+    return STANDARD_TYPES[ttype]
+
+
+def highlight_lines(src: str, lexer) -> str:
+    """Pygments tokens -> one <span class="ln"> per source line; lines that may wrap
+    get a hanging indent past their own indentation."""
+    lines: list[list[str]] = [[]]
+    for ttype, value in lexer.get_tokens(src):
+        cls = _css_class(ttype)
+        for k, piece in enumerate(value.split("\n")):
+            if k:
+                lines.append([])
+            if piece:
+                e = html.escape(piece, quote=False)
+                lines[-1].append(f'<span class="{cls}">{e}</span>' if cls else e)
+    while lines and not lines[-1]:
+        lines.pop()
+    raw = src.split("\n")
+    out = []
+    for k, l in enumerate(lines):
+        text = raw[k] if k < len(raw) else ""
+        style = ""
+        if len(text) > 50:
+            hang = len(text) - len(text.lstrip(" ")) + 4
+            style = f' style="padding-left:{hang}ch;text-indent:-{hang}ch"'
+        out.append(f'<span class="ln"{style}>{"".join(l) or " "}</span>')
+    return "".join(out)
+
+
+def humanize(stem: str) -> str:
+    words = re.sub(r"([a-z])([A-Z])", r"\1 \2", stem).replace("_", " ").replace("-", " ").split()
+    return " ".join(w if w[:1].isupper() else w[:1].upper() + w[1:] for w in words) or stem
+
+
+def _cap(s: str, period: bool = True) -> str:
+    s = s.strip()
+    if not s:
+        return ""
+    s = s[0].upper() + s[1:]
+    return s if (not period or s[-1] in ".?!:") else s + "."
+
+
+def short_title(t: str) -> str:
+    if len(t) <= 48:
+        return t
+    for sep in (":", " — ", " - ", "("):
+        if sep in t and 3 < t.index(sep) <= 48:
+            return t[: t.index(sep)].strip()
+    return t[:45].rsplit(" ", 1)[0] + "…"
+
+
+_MD = None
+
+
+def render_markdown(text: str) -> tuple[str, bool]:
+    """CommonMark (+ tables, strikethrough) with $...$ / $$...$$ math left for KaTeX."""
+    global _MD
+    if _MD is None:
+        from markdown_it import MarkdownIt
+        from mdit_py_plugins.dollarmath import dollarmath_plugin
+        _MD = (MarkdownIt("commonmark", {"typographer": True})
+               .enable(["table", "strikethrough", "replacements", "smartquotes"])
+               .use(dollarmath_plugin, allow_space=True, allow_digits=False, double_inline=True))
+    h = _MD.render(text)
+    h = h.replace("<table>", '<table class="booktabs md-table">')
+    return h, 'class="math' in h
+
+
+class Renderer:
+    def __init__(self, args, nb_path: Path):
+        self.args = args
+        self.nb_path = nb_path
+        self.nb_dir = nb_path.parent
+        self.lexer = HaskellLexer(stripnl=False)
+        self.reset()
+
+    def reset(self):
+        self.fig_no = 0
+        self.tab_no = 0
+        self.charts: list[dict] = []
+        self.uses_vega = False
+        self.uses_katex = False
+        self.missing: list[str] = []
+
+    # -- inline text -------------------------------------------------------
+    def inline(self, s: str) -> str:
+        """Tiny markdown subset for prose: `code`, **bold**, *italic*, $math$."""
+        parts = re.split(r"(`[^`]+`|\$\$[^$]+\$\$|\$[^$\n]+\$)", s)
+        out = []
+        for p in parts:
+            if p.startswith("`") and p.endswith("`") and len(p) > 1:
+                out.append(f"<code>{html.escape(p[1:-1])}</code>")
+            elif p.startswith("$$") and p.endswith("$$") and len(p) > 4:
+                self.uses_katex = True
+                out.append(f'<span class="math display">{html.escape(p[2:-2])}</span>')
+            elif p.startswith("$") and p.endswith("$") and len(p) > 2:
+                self.uses_katex = True
+                out.append(f'<span class="math inline">{html.escape(p[1:-1])}</span>')
+            else:
+                e = html.escape(p)
+                e = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", e)
+                e = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<em>\1</em>", e)
+                out.append(e)
+        return "".join(out)
+
+    def prose(self, lines: list[str]) -> str:
+        """Short label-like comments ("uhlig algorithm") become run-in headings;
+        longer comments become paragraphs."""
+        paras, cur = [], []
+        for ln in lines + [""]:
+            if ln:
+                cur.append(ln)
+            elif cur:
+                paras.append(cur)
+                cur = []
+        out = []
+
+        def label(t: str) -> bool:
+            return len(t) <= 48 and not re.search(r"[.!?;:,]$", t)
+
+        for p in paras:
+            if label(p[0]) and (len(p) == 1 or len(p[1]) > len(p[0])):
+                out.append(f'<p class="runin">{self.inline(_cap(p[0], period=False))}</p>')
+                p = p[1:]
+            if p and len(p) <= 4 and all(label(x) for x in p):
+                joined = '<span class="dot"> · </span>'.join(self.inline(_cap(x, period=False)) for x in p)
+                out.append(f'<p class="runin">{joined}</p>')
+            elif p:
+                text = " ".join(p)
+                out.append(f'<p class="prose">{self.inline(_cap(text, period=False))}</p>')
+        return "".join(out)
+
+    # -- code ----------------------------------------------------------------
+    def code_block(self, lines: list[str], n: int) -> str:
+        hl = highlight_lines("\n".join(lines), self.lexer)
+        long = " long" if len(lines) > LONG_CODE_LINES else ""
+        return (f'<div class="code{long}"><span class="label">In [{n}]</span>'
+                f'<pre class="hl">{hl}</pre></div>')
+
+    def setup_block(self, lines: list[str], n: int, mode: str) -> str:
+        count = len([l for l in lines if l.strip()])
+        mods = [m for l in lines for m in re.findall(r"^\s*import\s+(?:qualified\s+)?([\w.]+)", l)]
+        listing = ", ".join(mods[:6]) + (", …" if len(mods) > 6 else "")
+        if mode == "print":
+            return (f'<p class="setup-note"><span class="sc">Setup.</span> {count} lines of GHCi options and '
+                    f'imports{": " + html.escape(listing) if listing else ""} (omitted).</p>')
+        return (f'<details class="setup"><summary><span class="sc">Setup</span>'
+                f'<span class="setup-meta"> — {count} lines'
+                f'{" · " + html.escape(listing) if listing else ""}</span></summary>'
+                f'{self.code_block(lines, n)}</details>')
+
+    # -- outputs -------------------------------------------------------------
+    def num_html(self, n: Num, sig: int = 4) -> str:
+        return f'<span class="num" title="{html.escape(n.raw)}">{fmt_num(n.value, sig)}</span>'
+
+    def matrix_html(self, rows: list[list[Num]], label: str = "") -> str:
+        body = "".join("<tr>" + "".join(f"<td>{self.num_html(x)}</td>" for x in r) + "</tr>" for r in rows)
+        lab = f'<span class="dim">{label}</span>' if label else ""
+        return f'<span class="mat-wrap"><span class="mat"><table>{body}</table></span>{lab}</span>'
+
+    def value_html(self, v, top: bool = False) -> str:
+        if isinstance(v, Num):
+            return self.num_html(v, 6 if top else 4)
+        if isinstance(v, Str):
+            return f'<span class="str">“{html.escape(v.text)}”</span>'
+        if isinstance(v, Mat):
+            rows = [v.data[i * v.cols:(i + 1) * v.cols] for i in range(v.rows)]
+            return self.matrix_html(rows, f"{v.rows}×{v.cols}" if v.rows * v.cols > 1 else "")
+        if isinstance(v, Lst):
+            if v.items and all(isinstance(x, Num) for x in v.items):
+                cells = "".join(self.num_html(x) for x in v.items)
+                return (f'<span class="mat-wrap"><span class="mat vec">{cells}</span>'
+                        f'<span class="dim">list of {len(v.items)}</span></span>')
+            inner = '<span class="sep">, </span>'.join(self.value_html(x) for x in v.items)
+            return f'<span class="lst"><span class="br">[</span>{inner}<span class="br">]</span></span>'
+        if isinstance(v, Tup):
+            if all(isinstance(x, (Num, Str)) for x in v.items):
+                inner = ", ".join(self.value_html(x) for x in v.items)
+                return f'<span class="tup-inline">({inner})</span>'
+            inner = '<span class="sep">,</span>'.join(f'<span class="item">{self.value_html(x)}</span>' for x in v.items)
+            return f'<span class="tup"><span class="paren">(</span>{inner}<span class="paren">)</span></span>'
+        return html.escape(str(v))
+
+    def table_html(self, vals: list[Tup], caption: str) -> str:
+        self.tab_no += 1
+        groups = [x for x in vals[0].items[1:]]
+        head_top, head_sub, rules = ['<th class="stub"></th>'], ['<th class="stub"></th>'], []
+        col = 2
+        nested = any(isinstance(g, Tup) for g in groups)
+        for gi, g in enumerate(groups, 1):
+            width = len(g.items) if isinstance(g, Tup) else 1
+            head_top.append(f'<th colspan="{width}" class="grp">({gi})</th>')
+            for k in range(width):
+                head_sub.append(f'<th class="sub">{"abcdefgh"[k] if width > 1 else ""}</th>')
+            if width > 1:
+                rules.append((col, col + width - 1))
+            col += width
+        rows = []
+        for v in vals:
+            cells = [f'<th scope="row">{html.escape(v.items[0].text)}</th>']
+            for g in v.items[1:]:
+                for x in (g.items if isinstance(g, Tup) else [g]):
+                    cells.append(f'<td title="{html.escape(x.raw)}">{fmt_fixed(x.value)}</td>')
+            rows.append("<tr>" + "".join(cells) + "</tr>")
+        thead = "<tr>" + "".join(head_top) + "</tr>"
+        if nested:
+            thead += "<tr>" + "".join(head_sub) + "</tr>"
+        cap = f" {self.inline(_cap(caption))}" if caption else ""
+        return (f'<figure class="tbl" id="tab-{self.tab_no}"><figcaption><span class="fignum">Table {self.tab_no}.</span>{cap}</figcaption>'
+                f'<table class="booktabs{" nested" if nested else ""}"><thead>{thead}</thead><tbody>{"".join(rows)}</tbody></table></figure>')
+
+    def output_html(self, text: str, n: int, caption: str) -> str:
+        vals, rest = ValueParser(text).top()
+        raw = f'<pre class="raw">{html.escape(text)}</pre>'
+        label = f'<span class="label">Out [{n}]</span>'
+        if not vals:
+            return f'<div class="out">{label}{raw}</div>'
+        parts, i = [], 0
+        while i < len(vals):  # group consecutive table rows
+            j = i
+            while j < len(vals) and isinstance(vals[j], Tup) and vals[j].items and isinstance(vals[j].items[0], Str):
+                j += 1
+            if j - i >= 2 and table_rows(vals[i:j]):
+                parts.append(("table", vals[i:j]))
+                i = j
+            else:
+                parts.append(("val", vals[i]))
+                i += 1
+        if len(parts) == 1 and parts[0][0] == "table" and not rest:
+            return self.table_html(parts[0][1], caption) + f'<details class="rawbox"><summary>raw output</summary>{raw}</details>'
+        pretty = []
+        for kind, p in parts:
+            if kind == "table":
+                pretty.append(self.table_html(p, caption))
+            else:
+                pretty.append(f'<div class="val">{self.value_html(p, top=True)}</div>')
+        if rest:
+            pretty.append(f'<pre class="rest">{html.escape(rest)}</pre>')
+        scal = all(k == "val" and isinstance(p, Num) for k, p in parts)
+        cls = "pretty scalars" if scal and len(parts) > 1 else "pretty"
+        return (f'<div class="out has-pretty">{label}<button class="rawtoggle" type="button" title="show the raw GHCi output">raw</button>'
+                f'<div class="{cls}">{"".join(pretty)}</div>{raw}</div>')
+
+    # -- figures -------------------------------------------------------------
+    def chart_div(self, spec: dict, panel: bool) -> str:
+        if spec["type"] == "missing":
+            self.missing.append(spec["path"])
+            return (f'<div class="chart-missing">Chart not available'
+                    f'<span class="path">{html.escape(spec["path"])}</span></div>')
+        cid = f"chart-{len(self.charts) + 1}"
+        if spec["type"] == "plotly":
+            payload = {"id": cid, "type": "plotly", "panel": panel,
+                       **prepare_plotly(spec, panel, self.args.keep_plot_style)}
+        elif spec["type"] == "vega":
+            self.uses_vega = True
+            vs = copy.deepcopy(spec["spec"])
+            vs.pop("title", None)
+            payload = {"id": cid, "type": "vega", "panel": panel, "spec": vs}
+        else:
+            doc = html.escape(spec["html"], quote=True)
+            return f'<iframe class="chart-frame" sandbox="allow-scripts" srcdoc="{doc}"></iframe>'
+        self.charts.append(payload)
+        return f'<div class="chart{" panel-chart" if panel else ""}" id="{cid}"></div>'
+
+    def figure(self, specs: list[dict], fallback_caption: str) -> str:
+        self.fig_no += 1
+        n = self.fig_no
+        titles = [chart_title(s) for s in specs]
+        if len(specs) == 1:
+            cap = titles[0] or fallback_caption or series_label(specs[0])
+            sub = series_label(specs[0]) if (titles[0] or fallback_caption) else ""
+            cap_html = self.inline(_cap(cap)) + (f' <span class="sub">{html.escape(_cap(sub))}</span>' if sub and sub != cap else "")
+            return (f'<figure class="fig single" id="fig-{n}">{self.chart_div(specs[0], panel=False)}'
+                    f'<figcaption><span class="fignum">Figure {n}.</span> {cap_html}</figcaption></figure>')
+        common = titles[0] if titles[0] and len(set(titles)) == 1 else ""
+        cap = common or fallback_caption
+        panels = []
+        for k, s in enumerate(specs):
+            letter = "abcdefghijklmnopqrstuvwxyz"[k % 26]
+            sub = (titles[k] if titles[k] and not common else "") or series_label(s)
+            panels.append(f'<div class="panel">{self.chart_div(s, panel=True)}'
+                          f'<div class="subcap"><span class="letter">({letter})</span> {html.escape(sub)}</div></div>')
+        cap_html = self.inline(_cap(cap)) if cap else ""
+        return (f'<figure class="fig panels" id="fig-{n}"><div class="grid">{"".join(panels)}</div>'
+                f'<figcaption><span class="fignum">Figure {n}.</span> {cap_html}</figcaption></figure>')
+
+    # -- document ------------------------------------------------------------
+    def render_cells(self, cells: list[Cell], mode: str) -> tuple[str, str]:
+        body, toc = [], []
+        counters = [0] * 7
+        n_cell = 0
+        first_content = True
+        def section(level: int, title_html: str) -> str:
+            lvl = min(level, 3)
+            counters[lvl] += 1
+            for j in range(lvl + 1, len(counters)):
+                counters[j] = 0
+            num = ".".join(str(c) for c in counters[1:lvl + 1])
+            sid = f"sec-{num.replace('.', '-')}"
+            tag = f"h{lvl + 1}"
+            toc.append(f'<li class="toc-{lvl}"><a href="#{sid}"><span class="secnum">{num}</span>'
+                       f"{title_html}</a></li>")
+            return f'<{tag} id="{sid}" class="sec"><span class="secnum">{num}</span>{title_html}</{tag}>'
+
+        for cell in cells:
+            if cell.kind == "md":
+                text = "\n".join(cell.md).strip()
+                if not text:
+                    continue
+                h, math = render_markdown(text)
+                self.uses_katex |= math
+                h = re.sub(r"<h([1-6])>(.*?)</h\1>", lambda m: section(int(m.group(1)), m.group(2)), h, flags=re.S)
+                body.append(f'<section class="cell md">{h}</section>')
+                continue
+            if cell.level and cell.title:
+                body.append(section(cell.level, self.inline(cell.title)))
+            if self.args.no_prose:
+                prose, code = [], tidy_lines(cell.code)
+            else:
+                prose, code = split_prose(cell.code)
+            segs = split_output(cell.output)
+            if not (prose or code or segs):
+                continue
+            n_cell += 1
+            setup = is_setup(code) and not prose and not any(isinstance(s, Chart) for s in segs)
+            if setup:
+                body.append(f'<section class="cell setup-cell">{self.setup_block(code, n_cell, mode)}</section>')
+                first_content = False
+                continue
+            first_content = False
+            parts = []
+            if prose:
+                parts.append(self.prose(prose))
+            if code:
+                parts.append(self.code_block(code, n_cell))
+            first_prose = next((p for p in prose if p), "")
+            group: list[dict] = []
+
+            def flush_group():
+                if not group:
+                    return
+                size = 1 if self.args.no_panels else 6
+                for k in range(0, len(group), size):
+                    parts.append(self.figure(group[k:k + size], first_prose))
+                group.clear()
+
+            for seg in segs:
+                if isinstance(seg, Chart):
+                    group.append(load_chart(seg, self.nb_dir))
+                else:
+                    flush_group()
+                    parts.append(self.output_html(seg, n_cell, first_prose))
+            flush_group()
+            body.append(f'<section class="cell">{"".join(parts)}</section>')
+        toc_html = ""
+        if len(toc) >= 2:
+            toc_html = ('<nav class="toc"><div class="toc-title">Contents</div><ol>'
+                        + "".join(toc) + "</ol></nav>")
+        return "".join(body), toc_html
+
+    def page(self, cells: list[Cell], mode: str) -> str:
+        """mode: "html" (interactive) or "print" (for the PDF)."""
+        self.reset()
+        body, toc = self.render_cells(cells, mode)
+        a = self.args
+        css = CSS_FILE.read_text(encoding="utf-8")
+        if mode == "print":
+            fonts = print_font_css()
+        else:
+            fonts = font_css()
+        head_fonts = f"<style>{fonts}</style>"
+        scripts = []
+        if any(c["type"] == "plotly" for c in self.charts):
+            local = cached_asset(PLOTLY_CDN, f"plotly-{PLOTLY_VERSION}.min.js") if (mode == "print" or a.inline_plotly) else None
+            if local and a.inline_plotly and mode == "html":
+                scripts.append(f"<script>{local.read_text(encoding='utf-8')}</script>")
+            elif local and mode == "print":
+                scripts.append(f'<script src="{local.as_uri()}"></script>')
+            else:
+                scripts.append(f'<script src="{PLOTLY_CDN}" charset="utf-8"></script>')
+        if self.uses_vega:
+            scripts += [f'<script src="{u}"></script>' for u in VEGA_CDN]
+        katex = katex_head(mode) if self.uses_katex else ""
+        title = html.escape(a.title)
+        meta = []
+        if a.subtitle:
+            meta.append(f'<p class="subtitle">{self.inline(a.subtitle)}</p>')
+        byline = [f'<span class="author">{html.escape(a.author)}</span>'] if a.author else []
+        if a.date:
+            byline.append(f'<span class="date">{html.escape(a.date)}</span>')
+        if byline:
+            meta.append('<p class="byline">' + '<span class="dot"> · </span>'.join(byline) + "</p>")
+        eyebrow = f'<p class="eyebrow">Notebook <span class="dot">·</span> <span class="file">{html.escape(self.nb_path.name)}</span></p>'
+        tools = ("" if mode == "print" else
+                 '<div class="tools"><button id="toggle-code" type="button">Hide code</button></div>')
+        running = short_title(a.short_title or a.title).replace("\\", "\\\\").replace('"', '\\"')
+        page_css = f'@page {{ @top-center {{ content: "{running}"; }} }} @page :first {{ @top-center {{ content: none; }} }}'
+        charts_json = json.dumps(self.charts, separators=(",", ":")).replace("</", "<\\/")
+        cls = " ".join(c for c in [f"mode-{mode}", "hide-code" if a.hide_code else ""] if c)
+        return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<meta name="generator" content="hasknote-compile">
+{head_fonts}
+<style>{css}
+{page_css}</style>
+{katex}
+{"".join(scripts)}
+</head>
+<body class="{cls}">
+<main class="paper">
+<header class="titleblock">{eyebrow}<h1 class="title">{title}</h1>{"".join(meta)}</header>
+{tools}
+{toc}
+{body}
+<footer class="colophon">Compiled from <span class="file">{html.escape(self.nb_path.name)}</span> with hasknote · {self.fig_no} figures{f", {self.tab_no} tables" if self.tab_no else ""}</footer>
+</main>
+<script>window.HASKNOTE = {{mode: {json.dumps(mode)}, printWidth: {PRINT_TEXT_WIDTH_PX}, charts: {charts_json}}};</script>
+<script>{PAGE_JS}</script>
+</body></html>
+"""
+
+
+PAGE_JS = r"""
+(function () {
+  const H = window.HASKNOTE, isPrint = H.mode === "print";
+  window.HASKNOTE_DONE = false;
+  const btn = document.getElementById("toggle-code");
+  if (btn) {
+    const sync = () => btn.textContent = document.body.classList.contains("hide-code") ? "Show code" : "Hide code";
+    sync();
+    btn.addEventListener("click", () => { document.body.classList.toggle("hide-code"); sync(); });
+  }
+  if (window.katex) document.querySelectorAll(".math").forEach(el => {
+    const disp = el.classList.contains("display") || el.classList.contains("block") || el.tagName === "DIV";
+    try { katex.render(el.textContent.trim(), el, {displayMode: disp, throwOnError: false}); } catch (e) { console.error(e); }
+  });
+  document.querySelectorAll(".rawtoggle").forEach(b => b.addEventListener("click", () => {
+    const box = b.closest(".out"); box.classList.toggle("show-raw");
+    b.textContent = box.classList.contains("show-raw") ? "pretty" : "raw";
+  }));
+  // Charts: 16:10 single figures, 3:2 panels; print sizes are fixed (A4 text block).
+  function dims(c, pr = isPrint) {
+    if (!pr) return {};
+    const gap = 16, w = c.panel ? Math.floor((H.printWidth - gap) / 2) : Math.round(H.printWidth * 0.86);
+    return {width: w, height: Math.round(w / (c.panel ? 1.5 : 1.6))};
+  }
+  async function draw(c) {
+    const el = document.getElementById(c.id);
+    if (!el) return;
+    const d = dims(c);
+    if (c.type === "plotly") {
+      if (typeof Plotly === "undefined") { el.outerHTML = '<div class="chart-missing">plotly.js could not be loaded</div>'; return; }
+      if (isPrint) { el.style.width = d.width + "px"; el.style.height = d.height + "px"; }
+      const layout = Object.assign({}, c.layout, d, {autosize: !isPrint});
+      const config = isPrint ? {staticPlot: true, displayModeBar: false}
+                             : {responsive: true, displaylogo: false, displayModeBar: "hover",
+                                modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d"],
+                                toImageButtonOptions: {format: "svg"}};
+      await Plotly.newPlot(el, c.traces, layout, config);
+    } else if (c.type === "vega") {
+      if (typeof vegaEmbed === "undefined") { el.outerHTML = '<div class="chart-missing">vega-embed could not be loaded</div>'; return; }
+      const spec = Object.assign({}, c.spec);
+      const w = isPrint ? d.width : el.clientWidth, h = isPrint ? d.height : el.clientHeight;
+      spec.width = w - 50; spec.height = h - 50;
+      spec.autosize = {type: "fit", contains: "padding"};
+      await vegaEmbed(el, spec, {renderer: "svg", actions: !isPrint,
+        config: {font: "LM Roman 10", view: {stroke: "#222"}}});
+    }
+  }
+  const ready = document.fonts && document.fonts.ready ? document.fonts.ready : Promise.resolve();
+  ready.then(() => Promise.all(H.charts.map(c => draw(c).catch(e => console.error(e)))))
+       .then(() => { window.HASKNOTE_DONE = true; document.body.dataset.done = "1"; });
+  if (!isPrint) {
+    // Printing the interactive page from a browser: freeze charts at the print width.
+    window.addEventListener("beforeprint", () => H.charts.forEach(c => {
+      const el = document.getElementById(c.id);
+      if (c.type === "plotly" && el && el.data) Plotly.relayout(el, Object.assign({autosize: false}, dims(c, true)));
+    }));
+    window.addEventListener("afterprint", () => H.charts.forEach(c => {
+      const el = document.getElementById(c.id);
+      if (c.type === "plotly" && el && el.data) Plotly.relayout(el, {autosize: true, width: null, height: null});
+    }));
+  }
+})();
+"""
+
+
+# --------------------------------------------------------------------------
+# Assets (cached under ~/.cache/hasknote/compile)
+
+UA_WOFF2 = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+
+
+def _fetch(url: str, timeout: float = 20, ua: str | None = UA_WOFF2) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": ua} if ua else {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def cached_asset(url: str, name: str) -> Path | None:
+    p = CACHE / name
+    if p.exists() and p.stat().st_size > 0:
+        return p
+    try:
+        data = _fetch(url, timeout=60)
+    except Exception as e:  # offline
+        print(f"hasknote-compile: could not download {url}: {e}", file=sys.stderr)
+        return None
+    CACHE.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    return p
+
+
+def _latin_modern_dir() -> Path | None:
+    """Latin Modern OTFs, extracted once from the GUST zip (or CTAN) into the cache."""
+    d = CACHE / "lm"
+    names = {f for _, _, _, f in LM_FACES}
+    if all((d / n).exists() for n in names):
+        return d
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        import io
+        import zipfile
+        z = zipfile.ZipFile(io.BytesIO(_fetch(LM_ZIP, timeout=90)))
+        for member in z.namelist():
+            base = member.rsplit("/", 1)[-1]
+            if base in names:
+                (d / base).write_bytes(z.read(member))
+    except Exception as e:
+        print(f"hasknote-compile: GUST download failed ({e}); trying CTAN", file=sys.stderr)
+    for n in names:
+        if not (d / n).exists():
+            try:
+                (d / n).write_bytes(_fetch(LM_FALLBACK.format(name=n), timeout=60))
+            except Exception as e:
+                print(f"hasknote-compile: could not get {n}: {e}", file=sys.stderr)
+    return d if any((d / n).exists() for n in names) else None
+
+
+def otf_to_ttf(src: Path, dst: Path) -> None:
+    """Convert a CFF-flavoured OpenType font to TrueType outlines (cubic -> quadratic).
+    Chromium/Skia embeds CFF fonts in PDFs as Type 3 (badly rendered by zathura,
+    evince, pdf.js); TrueType fonts are embedded as real CID TrueType fonts."""
+    from fontTools.pens.cu2quPen import Cu2QuPen
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.ttLib import TTFont, newTable
+
+    font = TTFont(str(src))
+    order = font.getGlyphOrder()
+    gs = font.getGlyphSet()
+    quad = {}
+    for name in order:
+        pen = TTGlyphPen(gs)
+        gs[name].draw(Cu2QuPen(pen, 1.0, reverse_direction=True))
+        quad[name] = pen.glyph()
+    font["loca"] = newTable("loca")
+    font["glyf"] = glyf = newTable("glyf")
+    glyf.glyphOrder = order
+    glyf.glyphs = quad
+    del font["CFF "]
+    if "VORG" in font:
+        del font["VORG"]
+    glyf.compile(font)
+    hmtx = font["hmtx"]
+    for name, g in glyf.glyphs.items():
+        if hasattr(g, "xMin"):
+            hmtx[name] = (hmtx[name][0], g.xMin)
+    maxp = font["maxp"] = newTable("maxp")
+    maxp.tableVersion = 0x00010000
+    for attr in ("maxZones", "maxTwilightPoints", "maxStorage", "maxFunctionDefs", "maxInstructionDefs",
+                 "maxStackElements", "maxSizeOfInstructions", "maxComponentElements"):
+        setattr(maxp, attr, 1 if attr == "maxZones" else 0)
+    maxp.compile(font)
+    post = font["post"]
+    post.formatType = 2.0
+    post.extraNames = []
+    post.mapping = {}
+    post.glyphOrder = order
+    font.sfntVersion = "\0\1\0\0"
+    font.save(str(dst))
+
+
+def _lm_ttf(otf: Path) -> Path:
+    d = CACHE / "lm-ttf"
+    d.mkdir(parents=True, exist_ok=True)
+    t = d / (otf.stem + ".ttf")
+    if not t.exists():
+        otf_to_ttf(otf, t)
+    return t
+
+
+def _code_font_file(patterns: list[str]) -> Path | None:
+    for pat in patterns:
+        try:
+            r = subprocess.run(["fc-match", pat, "--format=%{family}\t%{file}"], capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        fam, _, f = r.stdout.partition("\t")
+        want = pat.split(":")[0].replace(" ", "").lower()
+        if f and want in fam.replace(" ", "").lower():
+            return Path(f)
+    return None
+
+
+def font_faces() -> list[tuple[str, int, str, Path]]:
+    faces = []
+    lm = _latin_modern_dir()
+    if lm:
+        for fam, w, st, f in LM_FACES:
+            if (lm / f).exists():
+                try:
+                    faces.append((fam, w, st, _lm_ttf(lm / f)))
+                except Exception as e:  # keep the OTF (embedded as Type 3 in PDFs)
+                    print(f"hasknote-compile: TrueType conversion of {f} failed: {e}", file=sys.stderr)
+                    faces.append((fam, w, st, lm / f))
+    for fam, w, st, pats in CODE_FACES:
+        f = _code_font_file(pats)
+        if f:
+            faces.append((fam, w, st, f))
+    return faces
+
+
+def _face_rule(fam: str, w: int, st: str, src: str, fmt: str) -> str:
+    return (f"@font-face{{font-family:'{fam}';font-weight:{w};font-style:{st};font-display:block;"
+            f"src:url({src}) format('{fmt}');}}")
+
+
+def print_font_css() -> str:
+    """PDF / snippets: the full font files via file:// URLs. All are static OpenType
+    (CFF) or TrueType fonts, which Chromium embeds as real fonts (no Type 3)."""
+    fmt = {".otf": "opentype", ".ttf": "truetype"}
+    return "\n".join(_face_rule(fam, w, st, f.as_uri(), fmt.get(f.suffix.lower(), "opentype"))
+                     for fam, w, st, f in font_faces())
+
+
+_FONT_CSS: str | None = None
+
+
+def font_css() -> str:
+    """HTML: subset WOFF2 copies of the same fonts embedded as base64, so the page is
+    self-contained and looks the same on any machine (cached per font file)."""
+    global _FONT_CSS
+    if _FONT_CSS is not None:
+        return _FONT_CSS
+    from fontTools import subset
+    out = []
+    sub_dir = CACHE / "woff2"
+    sub_dir.mkdir(parents=True, exist_ok=True)
+    for fam, w, st, f in font_faces():
+        key = hashlib.sha1(f"{f}:{f.stat().st_size}:{SUBSET_UNICODES}".encode()).hexdigest()[:16]
+        target = sub_dir / f"{key}.woff2"
+        if not target.exists():
+            try:
+                opts = subset.Options()
+                opts.flavor = "woff2"
+                opts.layout_features = ["*"]  # keep ligatures, small caps, figures
+                opts.name_IDs = ["*"]
+                opts.notdef_outline = True
+                font = subset.load_font(str(f), opts)
+                ss = subset.Subsetter(opts)
+                ss.populate(unicodes=subset.parse_unicodes(SUBSET_UNICODES))
+                ss.subset(font)
+                subset.save_font(font, str(target), opts)
+            except Exception as e:
+                print(f"hasknote-compile: could not subset {f.name}: {e}", file=sys.stderr)
+                continue
+        b64 = base64.b64encode(target.read_bytes()).decode()
+        out.append(_face_rule(fam, w, st, f"data:font/woff2;base64,{b64}", "woff2"))
+    _FONT_CSS = "\n".join(out)
+    return _FONT_CSS
+
+
+def katex_dir() -> Path | None:
+    """KaTeX dist (js, css, fonts), downloaded once from the npm registry."""
+    d = CACHE / f"katex-{KATEX_VERSION}"
+    if (d / "katex.min.js").exists():
+        return d
+    try:
+        import io
+        import tarfile
+        tf = tarfile.open(fileobj=io.BytesIO(_fetch(KATEX_TGZ, timeout=90)), mode="r:gz")
+        d.mkdir(parents=True, exist_ok=True)
+        for m in tf.getmembers():
+            if not m.isfile() or not m.name.startswith("package/dist/"):
+                continue
+            rel = m.name[len("package/dist/"):]
+            if rel.startswith("contrib/") or rel.endswith((".min.js", ".min.css")) or (rel.startswith("fonts/") and rel.endswith(".woff2")):
+                t = d / rel
+                t.parent.mkdir(parents=True, exist_ok=True)
+                t.write_bytes(tf.extractfile(m).read())
+        return d
+    except Exception as e:
+        print(f"hasknote-compile: KaTeX unavailable ({e}); math stays as TeX source", file=sys.stderr)
+        return None
+
+
+def katex_head(mode: str) -> str:
+    """<head> snippet for KaTeX: inlined (fonts as base64) for the self-contained HTML,
+    file:// links for the PDF and snippet renderer."""
+    d = katex_dir()
+    if not d:
+        return ""
+    if mode != "html":
+        return (f'<link rel="stylesheet" href="{(d / "katex.min.css").as_uri()}">'
+                f'<script src="{(d / "katex.min.js").as_uri()}"></script>')
+    css = (d / "katex.min.css").read_text(encoding="utf-8")
+
+    def embed(m):
+        f = d / m.group(1)
+        if f.suffix == ".woff2" and f.exists():
+            return f"url(data:font/woff2;base64,{base64.b64encode(f.read_bytes()).decode()}) format(\"woff2\")"
+        return ""
+    css = re.sub(r"url\((fonts/[^)]+\.woff2)\)\s*format\([\"']woff2[\"']\)", embed, css)
+    css = re.sub(r",?\s*url\(fonts/[^)]+\.(?:woff|ttf)\)\s*format\([\"'](?:woff|truetype)[\"']\)", "", css)
+    js = (d / "katex.min.js").read_text(encoding="utf-8").replace("</script", "<\\/script")
+    return f"<style>{css}</style><script>{js}</script>"
+
+
+# --------------------------------------------------------------------------
+# PDF
+
+
+def find_chromium() -> str | None:
+    for name in ("chromium", "chromium-browser", "google-chrome-stable", "google-chrome", "chrome"):
+        if shutil.which(name):
+            return shutil.which(name)
+    return None
+
+
+def print_pdf(page_html: str, pdf_path: Path, budget_ms: int) -> None:
+    chrome = find_chromium()
+    if not chrome:
+        sys.exit("hasknote-compile: chromium not found on PATH (needed for the PDF)")
+    with tempfile.TemporaryDirectory(prefix="hasknote-") as tmp:
+        src = Path(tmp) / "print.html"
+        src.write_text(page_html, encoding="utf-8")
+        cmd = [chrome, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+               "--allow-file-access-from-files", f"--user-data-dir={tmp}/profile",
+               "--run-all-compositor-stages-before-draw", f"--virtual-time-budget={budget_ms}",
+               "--no-pdf-header-footer", f"--print-to-pdf={pdf_path}", src.as_uri()]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        if r.returncode != 0 or not pdf_path.exists():
+            sys.stderr.write(r.stderr)
+            sys.exit("hasknote-compile: chromium failed to print the PDF")
+
+
+# --------------------------------------------------------------------------
+# Markdown snippet -> PNG (for the Neovim inline preview)
+
+SNIPPET_JS = r"""
+if (window.katex) document.querySelectorAll(".math").forEach(el => {
+  const disp = el.classList.contains("block") || el.classList.contains("display") || el.tagName === "DIV";
+  try { katex.render(el.textContent.trim(), el, {displayMode: disp, throwOnError: false}); } catch (e) {}
+});
+"""
+
+
+def render_snippet(md_file: Path, out_png: Path, width: int, pad: int = 16) -> None:
+    from PIL import Image, ImageChops
+
+    text = md_file.read_text(encoding="utf-8", errors="replace")
+    body, math = render_markdown(text)
+    body = re.sub(r"<h([1-6])>", lambda m: f'<h{min(int(m.group(1)) + 1, 6)} class="sec">', body)
+    body = re.sub(r"</h([1-6])>", lambda m: f"</h{min(int(m.group(1)) + 1, 6)}>", body)
+    page = f"""<!doctype html><html><head><meta charset="utf-8">
+<style>{print_font_css()}</style><style>{CSS_FILE.read_text(encoding="utf-8")}</style>
+{katex_head("snippet") if math else ""}
+</head><body class="mode-snippet"><main class="md snippet" style="width:{width}px">{body}</main>
+<script>{SNIPPET_JS}</script></body></html>"""
+    chrome = find_chromium()
+    if not chrome:
+        sys.exit("hasknote-compile: chromium not found on PATH")
+    lines = text.count("\n") + 1
+    height = max(240, min(12000, 120 + 46 * lines + 90 * text.count("$$")))
+    with tempfile.TemporaryDirectory(prefix="hasknote-snip-") as tmp:
+        src = Path(tmp) / "snippet.html"
+        src.write_text(page, encoding="utf-8")
+        shot = Path(tmp) / "shot.png"
+        cmd = [chrome, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+               "--allow-file-access-from-files", f"--user-data-dir={tmp}/profile", "--hide-scrollbars",
+               "--force-device-scale-factor=2", f"--window-size={width},{height}",
+               "--default-background-color=ffffffff", "--virtual-time-budget=1500",
+               f"--screenshot={shot}", src.as_uri()]
+        subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if not shot.exists():
+            sys.exit("hasknote-compile: chromium could not render the snippet")
+        im = Image.open(shot).convert("RGB")
+    bbox = ImageChops.difference(im, Image.new("RGB", im.size, (255, 255, 255))).getbbox()
+    p2 = pad * 2
+    if bbox:
+        x0, y0, x1, y1 = bbox
+        im = im.crop((max(0, x0 - p2), max(0, y0 - p2), min(im.width, x1 + p2), min(im.height, y1 + p2)))
+        # keep the full requested width so text size is stable across previews
+        canvas = Image.new("RGB", (width * 2, im.height), (255, 255, 255))
+        canvas.paste(im, (max(0, x0 - p2), 0))
+        im = canvas
+    else:
+        im = Image.new("RGB", (width * 2, p2 * 2), (255, 255, 255))
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    im.save(out_png, optimize=False, compress_level=3)
+
+
+# --------------------------------------------------------------------------
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(prog="hasknote-compile", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("notebook", type=Path, nargs="?", help="hasknote notebook (.hs)")
+    ap.add_argument("-o", "--outdir", type=Path,
+                    help="output directory (default: next to the notebook); with --md-snippet: the output PNG")
+    ap.add_argument("--md-snippet", type=Path, metavar="IN.md",
+                    help="render a markdown fragment to a tightly cropped PNG (needs -o OUT.png)")
+    ap.add_argument("--width", type=int, default=760, help="--md-snippet: content width in CSS px (default 760)")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--html-only", action="store_true", help="only write the HTML")
+    g.add_argument("--pdf-only", action="store_true", help="only write the PDF")
+    ap.add_argument("--title", help="document title (default: `-- title:` comment, else the humanized file name)")
+    ap.add_argument("--subtitle", default=None, help="subtitle line under the title")
+    ap.add_argument("--short-title", default=None, help="running header of the PDF (default: shortened title)")
+    ap.add_argument("--author", default=None, help="author (default: `-- author:` comment, else none)")
+    ap.add_argument("--date", default=None, help="date line (default: today; '' to omit)")
+    ap.add_argument("--hide-code", action="store_true", help="hide code cells (outputs and figures only)")
+    ap.add_argument("--no-prose", action="store_true", help="keep leading -- comments as code instead of prose")
+    ap.add_argument("--no-panels", action="store_true", help="one figure per chart instead of panel grids")
+    ap.add_argument("--keep-plot-style", action="store_true",
+                    help="keep each chart's own plotly template instead of the page's academic one")
+    ap.add_argument("--inline-plotly", action="store_true",
+                    help="embed plotly.js in the HTML (works offline, +3.5 MB)")
+    ap.add_argument("--budget", type=int, default=20000, help="chromium virtual time budget in ms (default 20000)")
+    a = ap.parse_args()
+
+    if a.md_snippet:
+        if not a.outdir:
+            ap.error("--md-snippet needs -o OUT.png")
+        out = a.outdir.expanduser().resolve()
+        render_snippet(a.md_snippet.expanduser(), out, a.width)
+        print(out)
+        return
+    if not a.notebook:
+        ap.error("the notebook argument is required")
+    nb = a.notebook.expanduser().resolve()
+    if not nb.is_file():
+        sys.exit(f"hasknote-compile: no such file: {a.notebook}")
+    cells = parse_notebook(nb.read_text(encoding="utf-8", errors="replace"))
+    meta = take_directives(cells)
+    a.title = a.title or meta.get("title") or humanize(nb.stem)
+    a.subtitle = a.subtitle if a.subtitle is not None else meta.get("subtitle", "")
+    a.author = a.author if a.author is not None else meta.get("author", "")
+    if a.date is None:
+        d = dt.date.today()
+        a.date = meta.get("date") or f"{d.day} {d.strftime('%B %Y')}"
+    outdir = a.outdir.expanduser().resolve() if a.outdir else nb.parent
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    r = Renderer(a, nb)
+    if not a.pdf_only:
+        out = outdir / f"{nb.stem}.html"
+        out.write_text(r.page(cells, "html"), encoding="utf-8")
+        print(f"wrote {out}  ({r.fig_no} figures, {len(r.charts)} charts, {r.tab_no} tables)")
+    if not a.html_only:
+        out = outdir / f"{nb.stem}.pdf"
+        print_pdf(r.page(cells, "print"), out, a.budget)
+        print(f"wrote {out}")
+    for m in dict.fromkeys(r.missing):
+        print(f"warning: chart not found: {m}", file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

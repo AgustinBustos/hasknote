@@ -1,1 +1,5 @@
 pack
+# build artifacts and backups
+hs/dist-newstyle/
+*.bak.*
+__pycache__/

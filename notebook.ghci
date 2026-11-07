@@ -1,0 +1,9 @@
+-- Loaded from ~/.ghci. Helpers for the nvim ---HS/---HF notebooks.
+-- An import (unlike a definition) survives :set -package / :load resets.
+import Hasknote
+
+-- :declareColumns df  -> one typed binding per column (year :: Expr Int, ...),
+-- names mangled ("NY.GDP.MKTP.KN" -> ny_gdp_mktp_kn). dataframe documents this
+-- macro but doesn't ship it on Hackage. The dummy data decl makes ghci parse
+-- the splice as a declaration instead of an expression.
+:def! declareColumns \s -> return (":set -XTemplateHaskell\ndata DeclareColumns_; $(DataFrame.declareColumns (" ++ s ++ "))")

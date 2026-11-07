@@ -1,0 +1,9 @@
+cabal-version: 2.4
+name:          hasknote
+version:       0.1.0.0
+synopsis:      Helpers for the nvim ---HS/---HF Haskell notebooks
+
+library
+  exposed-modules:  Hasknote
+  build-depends:    base, hvega, aeson, directory, time, plotlyhs, lucid
+  default-language: Haskell2010
