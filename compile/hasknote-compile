@@ -86,7 +86,7 @@ BODY_FONT = "'LM Roman 10', 'Latin Modern Roman', 'CMU Serif', 'Computer Modern'
 
 # A4 text block for the PDF: 210mm - 2*22mm = 166mm = ~627 CSS px.
 PRINT_TEXT_WIDTH_PX = 627
-LONG_CODE_LINES = 26  # longer code blocks may split across PDF pages
+LONG_CODE_LINES = 12  # longer code blocks may split across PDF pages (continuation keeps its box)
 
 HS_RE = re.compile(r"^-{2,}HS(#*)\s*(.*?)\s*$")
 HF_RE = re.compile(r"^-{2,}HF\s*$")
@@ -1020,7 +1020,7 @@ PAGE_JS = r"""
   function dims(c, pr = isPrint) {
     if (!pr) return {};
     const gap = 16, w = c.panel ? Math.floor((H.printWidth - gap) / 2) : Math.round(H.printWidth * 0.86);
-    return {width: w, height: Math.round(w / (c.panel ? 1.5 : 1.6))};
+    return {width: w, height: Math.round(w / (c.panel ? 1.9 : 1.6))};
   }
   async function draw(c) {
     const el = document.getElementById(c.id);
@@ -1030,11 +1030,14 @@ PAGE_JS = r"""
       if (typeof Plotly === "undefined") { el.outerHTML = '<div class="chart-missing">plotly.js could not be loaded</div>'; return; }
       if (isPrint) { el.style.width = d.width + "px"; el.style.height = d.height + "px"; }
       const layout = Object.assign({}, c.layout, d, {autosize: !isPrint});
+      if (isPrint) layout.font = Object.assign({}, c.layout.font || {}, {size: c.panel ? 10 : 11});
       const config = isPrint ? {staticPlot: true, displayModeBar: false}
                              : {responsive: true, displaylogo: false, displayModeBar: "hover",
                                 modeBarButtonsToRemove: ["lasso2d", "select2d", "autoScale2d"],
                                 toImageButtonOptions: {format: "svg"}};
-      await Plotly.newPlot(el, c.traces, layout, config);
+      const traces = !isPrint ? c.traces : c.traces.map(t => Object.assign({}, t,
+        {line: Object.assign({width: c.panel ? 1.1 : 1.3}, t.line || {})}));
+      await Plotly.newPlot(el, traces, layout, config);
     } else if (c.type === "vega") {
       if (typeof vegaEmbed === "undefined") { el.outerHTML = '<div class="chart-missing">vega-embed could not be loaded</div>'; return; }
       const spec = Object.assign({}, c.spec);
@@ -1305,21 +1308,780 @@ def find_chromium() -> str | None:
     return None
 
 
-def print_pdf(page_html: str, pdf_path: Path, budget_ms: int) -> None:
+# --------------------------------------------------------------------------
+# LaTeX output: notebook -> .tex (+ vector figures) -> pdflatex -> PDF
+
+from pygments.formatters.latex import LatexFormatter, escape_tex
+from pygments.style import Style
+from pygments.token import (Comment, Error, Keyword, Name, Number, Operator, Punctuation,
+                            String, Token)
+
+
+class HasknoteStyle(Style):
+    """Same quiet, cool palette as the HTML stylesheet."""
+    background_color = "#ffffff"
+    styles = {
+        Comment: "#8a919e",
+        Keyword: "#2c4a7c",
+        Operator.Word: "#2c4a7c",
+        Keyword.Type: "#2f6668",
+        Name.Class: "#2f6668",
+        Name.Namespace: "#2f6668",
+        String: "#7d3c5f",
+        Number: "#5b3f8c",
+        Operator: "#5b6472",
+        Punctuation: "#5b6472",
+        Error: "",
+    }
+
+
+TEX_SPECIALS = {"\\": r"\textbackslash{}", "{": r"\{", "}": r"\}", "$": r"\$", "&": r"\&",
+                "#": r"\#", "^": r"\textasciicircum{}", "_": r"\_", "%": r"\%", "~": r"\textasciitilde{}"}
+
+
+def tex_escape(s: str) -> str:
+    return "".join(TEX_SPECIALS.get(ch, ch) for ch in s)
+
+
+def tex_inline(s: str) -> str:
+    """Prose comments: `code`, **bold**, *italic*, $math$ (math passes through)."""
+    out = []
+    for p in re.split(r"(`[^`]+`|\$\$[^$]+\$\$|\$[^$\n]+\$)", s):
+        if p.startswith("`") and p.endswith("`") and len(p) > 1:
+            out.append(r"\texttt{" + tex_escape(p[1:-1]) + "}")
+        elif p.startswith("$$") and p.endswith("$$") and len(p) > 4:
+            out.append(r"\[" + p[2:-2] + r"\]")
+        elif p.startswith("$") and p.endswith("$") and len(p) > 2:
+            out.append(p)
+        else:
+            e = tex_escape(p)
+            e = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", e)
+            e = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"\\emph{\1}", e)
+            out.append(e)
+    return "".join(out)
+
+
+def fmt_num_tex(x: float, sig: int = 4) -> str:
+    if math.isnan(x):
+        return r"\mathrm{NaN}"
+    if math.isinf(x):
+        return r"\infty" if x > 0 else r"-\infty"
+    if abs(x) < 1e-12:
+        return "0"
+    ax = abs(x)
+    if 1e-4 <= ax < 1e6:
+        s = f"{x:.{sig}g}"
+        if "e" in s:
+            s = f"{x:.0f}"
+        return s
+    mant, exp = f"{x:.{sig - 1}e}".split("e")
+    mant = mant.rstrip("0").rstrip(".")
+    return rf"{mant}\times 10^{{{int(exp)}}}"
+
+
+# ---- Markdown -> LaTeX -----------------------------------------------------
+
+def markdown_to_tex(text: str) -> str:
+    render_markdown("")  # initialise the shared parser
+    tokens = _MD.parse(text)
+    out: list[str] = []
+    lists: list[str] = []
+    table: dict | None = None
+
+    def inline(children) -> str:
+        buf = []
+        for t in children or []:
+            ty = t.type
+            if ty == "text":
+                buf.append(tex_escape(t.content))
+            elif ty == "code_inline":
+                buf.append(r"\texttt{" + tex_escape(t.content) + "}")
+            elif ty == "math_inline":
+                buf.append("$" + t.content + "$")
+            elif ty == "math_inline_double":
+                buf.append(r"\[" + t.content + r"\]")
+            elif ty == "strong_open":
+                buf.append(r"\textbf{")
+            elif ty == "em_open":
+                buf.append(r"\emph{")
+            elif ty == "s_open":
+                buf.append("{")
+            elif ty in ("strong_close", "em_close", "s_close"):
+                buf.append("}")
+            elif ty == "link_open":
+                buf.append(r"\href{" + tex_escape(t.attrs.get("href", "")).replace(r"\#", r"\#") + "}{")
+            elif ty == "link_close":
+                buf.append("}")
+            elif ty == "softbreak":
+                buf.append("\n")
+            elif ty == "hardbreak":
+                buf.append(r"\\" + "\n")
+            elif ty == "image":
+                buf.append(r"\emph{[image: " + tex_escape(t.content or t.attrs.get("src", "")) + "]}")
+        return "".join(buf)
+
+    sections = {1: "section", 2: "subsection", 3: "subsubsection"}
+    i = 0
+    while i < len(tokens):
+        t = tokens[i]
+        ty = t.type
+        if ty == "heading_open":
+            lvl = int(t.tag[1])
+            cmd = sections.get(lvl, "paragraph")
+            out.append(f"\\{cmd}{{{inline(tokens[i + 1].children)}}}\n")
+            i += 3
+            continue
+        if ty == "paragraph_open":
+            body = inline(tokens[i + 1].children)
+            if table is None:
+                out.append(body + ("\n" if t.hidden else "\n\n"))
+            i += 3
+            continue
+        if ty == "bullet_list_open":
+            lists.append("itemize")
+            out.append("\\begin{itemize}\n")
+        elif ty == "ordered_list_open":
+            lists.append("enumerate")
+            out.append("\\begin{enumerate}\n")
+        elif ty in ("bullet_list_close", "ordered_list_close"):
+            out.append(f"\\end{{{lists.pop()}}}\n")
+        elif ty == "list_item_open":
+            out.append("\\item ")
+        elif ty == "blockquote_open":
+            out.append("\\begin{quote}\\itshape\n")
+        elif ty == "blockquote_close":
+            out.append("\\end{quote}\n")
+        elif ty in ("fence", "code_block"):
+            lang = (t.info or "").strip().lower()
+            out.append(verbatim_block(t.content.rstrip("\n").split("\n"),
+                                      lexer=HaskellLexer if lang in ("haskell", "hs", "ghci") else None))
+        elif ty == "math_block" or ty == "math_block_eqno":
+            out.append("\\[\n" + t.content.strip() + "\n\\]\n")
+        elif ty == "hr":
+            out.append("\\medskip\\noindent\\textcolor{hnrule}{\\rule{\\linewidth}{0.4pt}}\\medskip\n")
+        elif ty == "table_open":
+            table = {"rows": [], "align": []}
+        elif ty == "tr_open":
+            table["rows"].append([])
+        elif ty in ("th_open", "td_open"):
+            style = t.attrs.get("style", "") if t.attrs else ""
+            if len(table["rows"]) == 1:
+                table["align"].append("r" if "right" in style else "c" if "center" in style else "l")
+            table["rows"][-1].append(inline(tokens[i + 1].children))
+            i += 3
+            continue
+        elif ty == "thead_close":
+            table["head"] = len(table["rows"])
+        elif ty == "table_close":
+            rows, head = table["rows"], table.get("head", 1)
+            lines = ["\\begin{center}", "\\begin{tabular}{" + "".join(table["align"]) + "}", "\\toprule"]
+            for k, r in enumerate(rows):
+                lines.append(" & ".join(r) + r" \\")
+                if k == head - 1:
+                    lines.append("\\midrule")
+            lines += ["\\bottomrule", "\\end{tabular}", "\\end{center}"]
+            out.append("\n".join(lines) + "\n")
+            table = None
+        elif ty == "html_block":
+            pass
+        i += 1
+    return "".join(out).strip() + "\n"
+
+
+# ---- code blocks ------------------------------------------------------------
+
+_TEX_FMT = None
+
+
+def tex_formatter() -> LatexFormatter:
+    global _TEX_FMT
+    if _TEX_FMT is None:
+        _TEX_FMT = LatexFormatter(style=HasknoteStyle, commandprefix="PY")
+    return _TEX_FMT
+
+
+def _tex_token(ttype, value: str) -> str:
+    fmt = tex_formatter()
+    v = escape_tex(value, "PY")
+    if not v.isascii():
+        v = "".join(ch if ord(ch) < 128 or ch in "áéíóúñÁÉÍÓÚÑüÜ" else CODE_UNICODE_TEX.get(ch, "?") for ch in v)
+    styles = []
+    while ttype is not Token:
+        name = fmt.ttype2name.get(ttype)
+        if name:
+            styles.append(name)
+        ttype = ttype.parent
+    return f"\\PY{{{'+'.join(reversed(styles))}}}{{{v}}}" if styles else v
+
+
+def verbatim_block(lines: list[str], lexer=HaskellLexer, label: str = "", width: int = 78) -> str:
+    """Pygments-highlighted fancyvrb Verbatim; long lines are wrapped in Python with
+    a hanging indent (fancyvrb cannot wrap)."""
+    src = "\n".join(lines)
+    toks = list((lexer(stripnl=False) if lexer else _PlainLexer()).get_tokens(src))
+    logical: list[list[tuple]] = [[]]
+    for ttype, value in toks:
+        for k, piece in enumerate(value.split("\n")):
+            if k:
+                logical.append([])
+            if piece:
+                logical[-1].append((ttype, piece))
+    while logical and not logical[-1]:
+        logical.pop()
+    visual: list[list[tuple]] = []
+    for line in logical:
+        text = "".join(p for _, p in line)
+        if len(text) <= width:
+            visual.append(line)
+            continue
+        hang = min(len(text) - len(text.lstrip(" ")) + 4, width // 2)
+        cur, n = [], 0
+        limit = width
+        for ttype, piece in line:
+            while piece:
+                room = limit - n
+                if len(piece) > room and n > hang and " " not in piece.strip() and len(piece) <= 24:
+                    visual.append(cur)  # move a whole short token to the next line
+                    cur, n = [(Token.Text, " " * hang)], hang
+                    continue
+                if len(piece) <= room:
+                    cur.append((ttype, piece))
+                    n += len(piece)
+                    piece = ""
+                else:
+                    cut = piece.rfind(" ", 0, room + 1)
+                    cut = cut if cut > 0 and room - cut < 20 else room
+                    cur.append((ttype, piece[:cut]))
+                    visual.append(cur)
+                    piece = piece[cut:].lstrip(" ") if cut != room else piece[cut:]
+                    cur, n = [(Token.Text, " " * hang)], hang
+        visual.append(cur)
+    body = "\n".join("".join(_tex_token(t, p) for t, p in vl) for vl in visual)
+    lab = f"\\hnlabel{{{label}}}" if label else ""
+    return f"\\begin{{hncode}}\n{lab}{body}\n\\end{{hncode}}\n"
+
+
+class _PlainLexer:
+    def get_tokens(self, src):
+        yield Token.Text, src
+
+
+# ---- outputs --------------------------------------------------------------
+
+def value_tex(v, top: bool = False) -> str:
+    if isinstance(v, Num):
+        return fmt_num_tex(v.value, 6 if top else 4)
+    if isinstance(v, Str):
+        return r"\text{\itshape ``" + tex_escape(v.text) + "''}"
+    if isinstance(v, Mat):
+        rows = [v.data[i * v.cols:(i + 1) * v.cols] for i in range(v.rows)]
+        body = r" \\ ".join(" & ".join(fmt_num_tex(x.value) for x in r) for r in rows)
+        return r"\begin{bmatrix} " + body + r" \end{bmatrix}"
+    if isinstance(v, Lst):
+        if v.items and all(isinstance(x, Num) for x in v.items):
+            chunks = [v.items[k:k + 9] for k in range(0, len(v.items), 9)]
+            body = r" \\ ".join(r" & ".join(fmt_num_tex(x.value) for x in c) for c in chunks)
+            return r"\left[\begin{array}{" + "r" * max(len(c) for c in chunks) + "} " + body + r" \end{array}\right]"
+        return r"\left[" + r",\; ".join(value_tex(x) for x in v.items) + r"\right]"
+    if isinstance(v, Tup):
+        return r"\left(" + r",\;\; ".join(value_tex(x) for x in v.items) + r"\right)"
+    return r"\text{" + tex_escape(str(v)) + "}"
+
+
+class TexRenderer:
+    def __init__(self, args, nb_path: Path, figdir: Path):
+        self.args = args
+        self.nb_path = nb_path
+        self.nb_dir = nb_path.parent
+        self.figdir = figdir
+        self.fig_no = 0
+        self.tab_no = 0
+        self.charts: list[dict] = []  # charts to export: {"id", "file", payload...}
+        self.missing: list[str] = []
+
+    def table_tex(self, vals: list) -> str:
+        self.tab_no += 1
+        groups = vals[0].items[1:]
+        widths = [len(g.items) if isinstance(g, Tup) else 1 for g in groups]
+        nested = any(w > 1 for w in widths)
+        spec = "l" + "".join("r" * w for w in widths)
+        head1 = [""] + [f"\\multicolumn{{{w}}}{{c}}{{({k})}}" if w > 1 else f"({k})" for k, w in enumerate(widths, 1)]
+        # not a float: the table is a cell output and stays right below its code
+        lines = [r"\par\smallskip\begin{center}\begin{minipage}{\linewidth}\centering\small",
+                 f"\\captionof{{table}}{{}}\\label{{tab:{self.tab_no}}}",
+                 f"\\begin{{tabular}}{{{spec}}}", r"\toprule", " & ".join(head1) + r" \\"]
+        if nested:
+            col, rules = 2, []
+            for w in widths:
+                if w > 1:
+                    rules.append(f"\\cmidrule(lr){{{col}-{col + w - 1}}}")
+                col += w
+            lines.append("".join(rules))
+            sub = [""] + [f"\\textit{{{'abcdefgh'[k]}}}" if w > 1 else "" for w in widths for k in range(w)]
+            lines.append(" & ".join(sub) + r" \\")
+        lines.append(r"\midrule")
+        for v in vals:
+            cells = [tex_escape(v.items[0].text)]
+            for g in v.items[1:]:
+                for x in (g.items if isinstance(g, Tup) else [g]):
+                    cells.append(fmt_fixed(x.value).replace("−", "$-$"))
+            lines.append(" & ".join(cells) + r" \\")
+        lines += [r"\bottomrule", r"\end{tabular}", r"\end{minipage}\end{center}"]
+        return "\n".join(lines) + "\n"
+
+    def output_tex(self, text: str, n: int) -> str:
+        vals, rest = ValueParser(text).top()
+        if not vals:
+            return f"\\begin{{hnraw}}\n{verbatim_block(text.split(chr(10)), lexer=None, label=f'out [{n}]')}\\end{{hnraw}}\n"
+        parts, i = [], 0
+        while i < len(vals):
+            j = i
+            while j < len(vals) and isinstance(vals[j], Tup) and vals[j].items and isinstance(vals[j].items[0], Str):
+                j += 1
+            if j - i >= 2 and table_rows(vals[i:j]):
+                parts.append(("table", vals[i:j]))
+                i = j
+            else:
+                parts.append(("val", vals[i]))
+                i += 1
+        out = []
+        pending: list[str] = []
+
+        def flush():
+            if pending:
+                body = r" \\[2pt] ".join(f"\\displaystyle {p}" for p in pending)
+                out.append(f"\\begin{{hnout}}{{{n}}}\n$\\begin{{array}}[t]{{@{{}}l@{{}}}} {body} \\end{{array}}$\n\\end{{hnout}}\n")
+                pending.clear()
+
+        for kind, p in parts:
+            if kind == "table":
+                flush()
+                out.append(self.table_tex(p))
+            else:
+                pending.append(value_tex(p, top=True))
+        flush()
+        if rest:
+            out.append(f"\\begin{{hnraw}}\n{verbatim_block(rest.split(chr(10)), lexer=None)}\\end{{hnraw}}\n")
+        return "".join(out)
+
+    def chart_file(self, spec: dict, panel: bool) -> str | None:
+        if spec["type"] == "missing":
+            self.missing.append(spec["path"])
+            return None
+        if spec["type"] not in ("plotly", "vega"):
+            return None
+        k = len(self.charts) + 1
+        fname = f"chart-{k:02d}.pdf"
+        payload = {"id": f"c{k}", "file": fname, "panel": panel, "type": spec["type"]}
+        if spec["type"] == "plotly":
+            payload.update(prepare_plotly(spec, panel, self.args.keep_plot_style))
+        else:
+            vs = copy.deepcopy(spec["spec"])
+            vs.pop("title", None)
+            payload["spec"] = vs
+        self.charts.append(payload)
+        return f"{self.figdir.name}/{fname}"
+
+    def graphic(self, path: str | None, width: str) -> str:
+        if path is None:
+            return f"\\hnmissing{{{width}}}"
+        return f"\\includegraphics[width={width}]{{{path}}}"
+
+    def figure_tex(self, specs: list[dict], fallback: str) -> str:
+        self.fig_no += 1
+        titles = [chart_title(s) for s in specs]
+        if len(specs) == 1:
+            cap = titles[0] or fallback or series_label(specs[0])
+            sub = series_label(specs[0]) if (titles[0] or fallback) else ""
+            capt = tex_inline(_cap(cap)) + (f" {{\\color{{hnink2}}{tex_escape(_cap(sub))}}}" if sub and sub != cap else "")
+            g = self.graphic(self.chart_file(specs[0], False), "0.86\\linewidth")
+            return (f"\\begin{{figure}}[htbp]\n\\centering\n{g}\n\\caption{{{capt}}}\\label{{fig:{self.fig_no}}}\n\\end{{figure}}\n")
+        common = titles[0] if titles[0] and len(set(titles)) == 1 else ""
+        cap = common or fallback
+        subs = []
+        for k, s in enumerate(specs):
+            sub = (titles[k] if titles[k] and not common else "") or series_label(s)
+            g = self.graphic(self.chart_file(s, True), "\\linewidth")
+            sep = "\\hfill\n" if k % 2 == 0 else "\n\\par\\medskip\n"
+            subs.append(f"\\begin{{subfigure}}[t]{{0.485\\linewidth}}\n\\centering\n{g}\n\\caption{{{tex_escape(sub)}}}\n\\end{{subfigure}}{sep}")
+        return (f"\\begin{{figure}}[htbp]\n\\centering\n{''.join(subs)}"
+                f"\\caption{{{tex_inline(_cap(cap)) if cap else ''}}}\\label{{fig:{self.fig_no}}}\n\\end{{figure}}\n")
+
+    def body(self, cells: list[Cell]) -> tuple[str, int]:
+        out = []
+        n_cell = 0
+        n_sections = 0
+        cmds = {1: "section", 2: "subsection", 3: "subsubsection"}
+        for cell in cells:
+            if cell.kind == "md":
+                text = "\n".join(cell.md).strip()
+                if text:
+                    tex = markdown_to_tex(text)
+                    n_sections += len(re.findall(r"\\(?:sub)*section\{", tex))
+                    out.append(f"% --- markdown cell\n{tex}\n")
+                continue
+            if cell.level and cell.title:
+                out.append(f"\\{cmds.get(min(cell.level, 3))}{{{tex_inline(cell.title)}}}\n\n")
+                n_sections += 1
+            prose, code = ([], tidy_lines(cell.code)) if self.args.no_prose else split_prose(cell.code)
+            segs = split_output(cell.output)
+            if not (prose or code or segs):
+                continue
+            n_cell += 1
+            if is_setup(code) and not prose and not any(isinstance(s, Chart) for s in segs):
+                count = len([l for l in code if l.strip()])
+                mods = [m for l in code for m in re.findall(r"^\s*import\s+(?:qualified\s+)?([\w.]+)", l)]
+                listing = ", ".join(tex_escape(m) for m in mods[:6]) + (", \\ldots" if len(mods) > 6 else "")
+                out.append(f"% --- cell {n_cell}: setup (omitted)\n\\hnsetup{{{count} lines of GHCi options and imports"
+                           f"{': ' + listing if listing else ''}}}\n\n")
+                continue
+            out.append(f"% --- cell {n_cell}\n")
+            if prose:
+                out.append(self.prose_tex(prose))
+            if code and not self.args.hide_code:
+                out.append(verbatim_block(code, label=f"in [{n_cell}]"))
+            first_prose = next((p for p in prose if p), "")
+            group: list[dict] = []
+
+            def flush_group():
+                if group:
+                    size = 1 if self.args.no_panels else 6
+                    for k in range(0, len(group), size):
+                        out.append(self.figure_tex(group[k:k + size], first_prose))
+                    group.clear()
+
+            for seg in segs:
+                if isinstance(seg, Chart):
+                    group.append(load_chart(seg, self.nb_dir))
+                else:
+                    flush_group()
+                    out.append(self.output_tex(seg, n_cell))
+            flush_group()
+            out.append("\n")
+        return "".join(out), n_sections
+
+    def prose_tex(self, lines: list[str]) -> str:
+        paras, cur = [], []
+        for ln in lines + [""]:
+            if ln:
+                cur.append(ln)
+            elif cur:
+                paras.append(cur)
+                cur = []
+        out = []
+
+        def label(t):
+            return len(t) <= 48 and not re.search(r"[.!?;:,]$", t)
+
+        for p in paras:
+            if label(p[0]) and (len(p) == 1 or len(p[1]) > len(p[0])):
+                out.append(f"\\hnrunin{{{tex_inline(_cap(p[0], period=False))}}}\n")
+                p = p[1:]
+            if p and len(p) <= 4 and all(label(x) for x in p):
+                out.append("\\hnrunin{" + " \\textperiodcentered\\ ".join(tex_inline(_cap(x, period=False)) for x in p) + "}\n")
+            elif p:
+                out.append(tex_inline(_cap(" ".join(p), period=False)) + "\n\n")
+        return "".join(out)
+
+    def document(self, cells: list[Cell]) -> str:
+        a = self.args
+        body, n_sections = self.body(cells)
+        styledefs = tex_formatter().get_style_defs()
+        title = tex_inline(a.title)
+        short = tex_inline(short_title(a.short_title or a.title))
+        meta = []
+        if a.subtitle:
+            meta.append(f"{{\\large\\itshape\\color{{hnink2}} {tex_inline(a.subtitle)}\\par}}\\vspace{{3mm}}")
+        byline = []
+        if a.author:
+            byline.append(f"\\textsc{{{tex_escape(a.author)}}}")
+        if a.date:
+            byline.append(f"\\textit{{{tex_escape(a.date)}}}")
+        if byline:
+            meta.append("{\\color{hnink2} " + " \\enspace{\\color{hnmuted}\\textperiodcentered}\\enspace ".join(byline) + "\\par}")
+        toc = "\\tableofcontents\n\\vspace{4mm}\n" if n_sections >= 2 else ""
+        mono = ("% code font: FiraCode Nerd Font, converted for pdfTeX by hasknote-compile into ~/texmf\n"
+                "% (falls back to Latin Modern Mono when that conversion is not available)\n"
+                "\\IfFileExists{T1hnfira.fd}{\\pdfmapfile{+hasknote-fira.map}\\renewcommand{\\ttdefault}{hnfira}}{}"
+                if ensure_tex_code_font() else "% code font: Latin Modern Mono")
+        return TEX_TEMPLATE.replace("%%STYLEDEFS%%", styledefs).replace("%%MONO%%", mono) \
+            .replace("%%SHORT%%", short).replace("%%TITLE%%", title) \
+            .replace("%%FILE%%", tex_escape(self.nb_path.name)).replace("%%META%%", "\n".join(meta)) \
+            .replace("%%TOC%%", toc).replace("%%BODY%%", body) \
+            .replace("%%PDFTITLE%%", tex_escape(a.title)).replace("%%PDFAUTHOR%%", tex_escape(a.author or ""))
+
+
+def ensure_tex_code_font() -> bool:
+    """Make the code Nerd Font usable from pdfLaTeX: otftotfm writes TFM/VF/encoding files
+    and a map line (the TrueType file is embedded as is) into the user's TEXMFHOME, plus an
+    NFSS font definition T1hnfira.fd. Runs once; later builds and hand recompiles reuse it."""
+    try:
+        home = Path(subprocess.run(["kpsewhich", "-var-value", "TEXMFHOME"], capture_output=True,
+                                   text=True, timeout=20).stdout.strip() or Path.home() / "texmf")
+    except (OSError, subprocess.SubprocessError):
+        return False
+    fd = home / "tex/latex/hasknote/T1hnfira.fd"
+    if fd.exists():
+        return True
+    if not shutil.which("otftotfm"):
+        return False
+    faces = {"r": _code_font_file(CODE_FACES[0][3]), "sb": _code_font_file(CODE_FACES[1][3])}
+    if not faces["r"]:
+        return False
+    dirs = {k: home / f"fonts/{k}/hasknote" for k in ("tfm", "vf", "enc", "truetype", "map")}
+    dirs["map"] = home / "fonts/map/pdftex/hasknote"
+    for d in dirs.values():
+        d.mkdir(parents=True, exist_ok=True)
+    maplines = []
+    for key, f in faces.items():
+        if not f:
+            continue
+        shutil.copyfile(f, dirs["truetype"] / f.name)
+        r = subprocess.run(["otftotfm", "-e", "ec", "-f", "kern", "--no-updmap",
+                            f"--tfm-directory={dirs['tfm']}", f"--vf-directory={dirs['vf']}",
+                            f"--encoding-directory={dirs['enc']}", f"--pl-directory={dirs['tfm']}",
+                            f"--truetype-directory={dirs['truetype']}", f"--type42-directory={dirs['truetype']}",
+                            str(f), f"hnfira-{key}"], capture_output=True, text=True, timeout=120)
+        maplines += [l for l in r.stdout.splitlines() if l.startswith("hnfira-")]
+    if not maplines:
+        return False
+    (dirs["map"] / "hasknote-fira.map").write_text("\n".join(maplines) + "\n", encoding="utf-8")
+    fd.parent.mkdir(parents=True, exist_ok=True)
+    bold = "hnfira-sb" if faces["sb"] else "hnfira-r"
+    fd.write_text(f"""% FiraCode Nerd Font for pdfLaTeX (generated by hasknote-compile)
+\\ProvidesFile{{T1hnfira.fd}}
+\\DeclareFontFamily{{T1}}{{hnfira}}{{\\hyphenchar\\font=-1}}
+\\DeclareFontShape{{T1}}{{hnfira}}{{m}}{{n}}{{<-> s*[0.86] hnfira-r}}{{}}
+\\DeclareFontShape{{T1}}{{hnfira}}{{b}}{{n}}{{<-> s*[0.86] {bold}}}{{}}
+\\DeclareFontShape{{T1}}{{hnfira}}{{bx}}{{n}}{{<->ssub * hnfira/b/n}}{{}}
+\\DeclareFontShape{{T1}}{{hnfira}}{{m}}{{it}}{{<->ssub * hnfira/m/n}}{{}}
+\\DeclareFontShape{{T1}}{{hnfira}}{{m}}{{sl}}{{<->ssub * hnfira/m/n}}{{}}
+\\DeclareFontShape{{T1}}{{hnfira}}{{b}}{{it}}{{<->ssub * hnfira/b/n}}{{}}
+\\DeclareFontShape{{T1}}{{hnfira}}{{m}}{{sc}}{{<->ssub * hnfira/m/n}}{{}}
+""", encoding="utf-8")
+    return True
+
+
+CODE_UNICODE_TEX = {"→": r"\ensuremath{\to}", "←": r"\ensuremath{\leftarrow}", "λ": r"\ensuremath{\lambda}",
+                    "×": r"\ensuremath{\times}", "−": "-", "…": "...", "≤": r"\ensuremath{\le}",
+                    "≥": r"\ensuremath{\ge}", "≠": r"\ensuremath{\ne}", "α": r"\ensuremath{\alpha}",
+                    "β": r"\ensuremath{\beta}", "σ": r"\ensuremath{\sigma}"}
+
+
+TEX_TEMPLATE = r"""% Generated by hasknote-compile from %%FILE%%.
+% Rebuild by hand (from this directory):  pdflatex urep.tex && pdflatex urep.tex
+% (two runs resolve the contents and cross-references)
+\documentclass[11pt,a4paper]{article}
+
+% ---- fonts: Latin Modern (text and math), a Nerd Font for code ----------------
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{textcomp}
+\usepackage{amsmath,amssymb}
+\setcounter{MaxMatrixCols}{20}
+%%MONO%%
+\newcommand{\hntitlefont}{\fontfamily{lmr}\selectfont}
+
+% ---- page layout ----------------------------------------------------------------
+\usepackage[a4paper, top=27mm, bottom=26mm, left=27mm, right=27mm, headsep=8mm]{geometry}
+\usepackage{microtype}
+\usepackage{xcolor}
+\definecolor{hnink}{HTML}{1A1A1A}
+\definecolor{hnink2}{HTML}{3D4350}
+\definecolor{hnmuted}{HTML}{8A919E}
+\definecolor{hnrule}{HTML}{D0D5DD}
+\definecolor{hnaccent}{HTML}{2C4A7C}
+\color{hnink}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{fancyvrb}
+\usepackage{caption}
+\usepackage{subcaption}
+\DeclareCaptionFont{hnaccent}{\color{hnaccent}}
+\captionsetup{font=small, labelfont={sc,hnaccent}, labelsep=period, justification=centering}
+\captionsetup[subfigure]{font=footnotesize, labelfont={}, labelformat=parens, labelsep=space}
+\captionsetup[table]{position=top, skip=4pt}
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[C]{\small\itshape\color{hnink2}%%SHORT%%}
+\fancyfoot[C]{\small\color{hnink2}\thepage}
+\renewcommand{\headrulewidth}{0pt}
+\fancypagestyle{plain}{\fancyhf{}\renewcommand{\headrulewidth}{0pt}}
+\usepackage[hidelinks, pdftitle={%%PDFTITLE%%}, pdfauthor={%%PDFAUTHOR%%}]{hyperref}
+\usepackage{parskip}
+\setlength{\parskip}{4pt plus 1pt}
+
+% floats: let figures sit close to the code that made them
+\renewcommand{\topfraction}{0.9}
+\renewcommand{\bottomfraction}{0.8}
+\renewcommand{\textfraction}{0.07}
+\renewcommand{\floatpagefraction}{0.75}
+\setcounter{topnumber}{3}
+\setcounter{bottomnumber}{2}
+\setcounter{totalnumber}{4}
+\setlength{\textfloatsep}{12pt plus 4pt minus 2pt}
+
+% ---- notebook elements --------------------------------------------------------------
+% code syntax colours (Pygments, same palette as the HTML)
+%%STYLEDEFS%%
+% labels in the left margin: in [n] / out [n]
+\newcommand{\hnlabel}[1]{\makebox[0pt][r]{\normalfont\footnotesize\color{hnmuted}\textsc{#1}\hspace{9mm}}}
+% code cells: thin cool-grey rule on the left, may break across pages
+\DefineVerbatimEnvironment{hncode}{Verbatim}{commandchars=\\\{\}, fontsize=\small,
+  frame=leftline, framerule=1.2pt, rulecolor=\color{hnrule}, framesep=4mm,
+  xleftmargin=0mm, baselinestretch=1.08, formatcom=\color{hnink}}
+% outputs: indented, not split across pages
+\newenvironment{hnout}[1]{\par\smallskip\noindent\hspace*{4.4mm}%
+  \begin{minipage}[t]{\dimexpr\linewidth-4.4mm\relax}\hnlabel{out [#1]}}{\end{minipage}\par\medskip}
+\newenvironment{hnraw}{\color{hnink2}}{}
+\newcommand{\hnrunin}[1]{\par\medskip\noindent{\scshape #1}\par\nopagebreak\smallskip}
+\newcommand{\hnsetup}[1]{\par\noindent{\small\color{hnink2}\textsc{Setup.} #1 (omitted)}\par\medskip}
+\newcommand{\hnmissing}[1]{\fbox{\parbox[c][3cm][c]{#1}{\centering\itshape\color{hnmuted}Chart not available}}}
+\setlength{\fboxrule}{0.4pt}
+
+\begin{document}
+\thispagestyle{plain}
+\begin{center}
+{\footnotesize\color{hnmuted}\textsc{notebook} \enspace\textperiodcentered\enspace \textit{%%FILE%%}\par}
+\vspace{5mm}
+{\hntitlefont\fontsize{22}{27}\selectfont %%TITLE%%\par}
+\vspace{4mm}
+%%META%%
+\vspace{6mm}
+{\color{hnrule}\rule{\linewidth}{0.4pt}}
+\end{center}
+\vspace{2mm}
+%%TOC%%
+%%BODY%%
+\end{document}
+"""
+
+
+EXPORT_JS = r"""
+(async function () {
+  const H = window.HASKNOTE_EXPORT, W = H.width;
+  for (const c of H.charts) {
+    const el = document.createElement("div");
+    document.body.appendChild(el);
+    const w = c.panel ? Math.floor((W - 16) / 2) : Math.round(W * 0.86);
+    const h = Math.round(w / (c.panel ? 1.75 : 1.6));
+    let svg = "";
+    try {
+      if (c.type === "plotly") {
+        const layout = Object.assign({}, c.layout, {width: w, height: h, autosize: false});
+        // a family name without spaces: Plotly's SVG export does not escape quotes in style attributes
+        layout.font = Object.assign({}, c.layout.font || {}, {size: c.panel ? 11 : 12, family: "LMRoman10, serif"});
+        if (layout.legend) layout.legend = Object.assign({}, layout.legend, {font: {size: c.panel ? 9.5 : 11, family: "LMRoman10, serif"}});
+        const traces = c.traces.map(t => Object.assign({}, t, {line: Object.assign({width: c.panel ? 1.1 : 1.3}, t.line || {})}));
+        await Plotly.newPlot(el, traces, layout, {staticPlot: true});
+        const url = await Plotly.toImage(el, {format: "svg", width: w, height: h});
+        svg = decodeURIComponent(url.replace(/^data:image\/svg\+xml,/, ""));
+      } else if (c.type === "vega" && window.vegaEmbed) {
+        const spec = Object.assign({}, c.spec, {width: w - 50, height: h - 50});
+        const res = await vegaEmbed(el, spec, {renderer: "svg", actions: false, config: {font: "LM Roman 10"}});
+        svg = await res.view.toSVG();
+      }
+    } catch (e) { svg = "ERROR " + e; }
+    const ta = document.createElement("textarea");
+    ta.id = "svg-" + c.id; ta.textContent = btoa(unescape(encodeURIComponent(svg))); document.body.appendChild(ta);
+  }
+  document.title = "hasknote-export-done";
+})();
+"""
+
+
+def _fontconfig_file() -> Path:
+    """A fontconfig file that adds the cached Latin Modern TTFs, so rsvg-convert renders
+    chart text in the same LaTeX serif (nothing is installed system-wide)."""
+    font_faces()  # make sure the TTFs exist
+    conf = CACHE / "fonts.conf"
+    conf.write_text(f"""<?xml version="1.0"?>
+<!DOCTYPE fontconfig SYSTEM "fonts.dtd">
+<fontconfig>
+  <include ignore_missing="yes">/etc/fonts/fonts.conf</include>
+  <dir>{CACHE / 'lm-ttf'}</dir>
+  <alias binding="strong"><family>LMRoman10</family><prefer><family>LM Roman 10</family></prefer></alias>
+  <cachedir>{CACHE / 'fc-cache'}</cachedir>
+</fontconfig>
+""", encoding="utf-8")
+    return conf
+
+
+def export_charts(charts: list[dict], figdir: Path, budget_ms: int) -> None:
+    """Render each chart once in headless Chromium, take Plotly's SVG export and turn
+    it into a vector PDF with rsvg-convert."""
+    if not charts:
+        return
     chrome = find_chromium()
-    if not chrome:
-        sys.exit("hasknote-compile: chromium not found on PATH (needed for the PDF)")
-    with tempfile.TemporaryDirectory(prefix="hasknote-") as tmp:
-        src = Path(tmp) / "print.html"
-        src.write_text(page_html, encoding="utf-8")
+    if not chrome or not shutil.which("rsvg-convert"):
+        sys.exit("hasknote-compile: the PDF needs chromium and rsvg-convert on PATH")
+    figdir.mkdir(parents=True, exist_ok=True)
+    plotly = cached_asset(PLOTLY_CDN, f"plotly-{PLOTLY_VERSION}.min.js")
+    scripts = f'<script src="{plotly.as_uri()}"></script>' if plotly else f'<script src="{PLOTLY_CDN}"></script>'
+    if any(c["type"] == "vega" for c in charts):
+        scripts += "".join(f'<script src="{u}"></script>' for u in VEGA_CDN)
+    data = json.dumps({"width": PRINT_TEXT_WIDTH_PX - 20, "charts": charts}, separators=(",", ":")).replace("</", "<\\/")
+    lm10 = next((f for fam, w, st, f in font_faces() if fam == "LM Roman 10" and w == 400 and st == "normal"), None)
+    alias = f"@font-face{{font-family:LMRoman10;src:url({lm10.as_uri()});}}" if lm10 else ""
+    page = (f"<!doctype html><html><head><meta charset='utf-8'><style>{print_font_css()}{alias}</style>{scripts}</head>"
+            f"<body><script>window.HASKNOTE_EXPORT = {data};</script>"
+            f"<script>document.fonts.ready.then(() => {{ {EXPORT_JS} }});</script></body></html>")
+    env = dict(os.environ, FONTCONFIG_FILE=str(_fontconfig_file()))
+    with tempfile.TemporaryDirectory(prefix="hasknote-fig-") as tmp:
+        src = Path(tmp) / "export.html"
+        src.write_text(page, encoding="utf-8")
         cmd = [chrome, "--headless=new", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
                "--allow-file-access-from-files", f"--user-data-dir={tmp}/profile",
-               "--run-all-compositor-stages-before-draw", f"--virtual-time-budget={budget_ms}",
-               "--no-pdf-header-footer", f"--print-to-pdf={pdf_path}", src.as_uri()]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        if r.returncode != 0 or not pdf_path.exists():
-            sys.stderr.write(r.stderr)
-            sys.exit("hasknote-compile: chromium failed to print the PDF")
+               f"--virtual-time-budget={budget_ms}", "--dump-dom", src.as_uri()]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        dom = r.stdout
+        if os.environ.get("HASKNOTE_DEBUG"):
+            shutil.copyfile(src, figdir / "_export.html")
+            (figdir / "_export.dom.html").write_text(dom + "\n<!-- stderr\n" + r.stderr + "\n-->", encoding="utf-8")
+        for c in charts:
+            m = re.search(rf'<textarea id="svg-{c["id"]}">(.*?)</textarea>', dom, re.S)
+            try:
+                svg = base64.b64decode(m.group(1).strip()).decode("utf-8") if m else ""
+            except ValueError:
+                svg = ""
+            out = figdir / c["file"]
+            if not svg.startswith("<svg"):
+                print(f"hasknote-compile: chart {c['id']} could not be exported: {svg[:120]}", file=sys.stderr)
+                continue
+            svg_path = Path(tmp) / (c["id"] + ".svg")
+            svg_path.write_text(svg, encoding="utf-8")
+            rr = subprocess.run(["rsvg-convert", "-f", "pdf", "-o", str(out), str(svg_path)],
+                                capture_output=True, text=True, env=env, timeout=60)
+            if rr.returncode != 0:
+                print(f"hasknote-compile: rsvg-convert failed for {c['file']}: {rr.stderr.strip()}", file=sys.stderr)
+
+
+def compile_tex(tex_path: Path, pdf_path: Path) -> None:
+    """Run pdflatex twice in a temporary build directory and copy the PDF out.
+    (pdfLaTeX, not LuaLaTeX: this TeX Live has no luaotfload, so fontspec cannot load
+    fonts; Latin Modern comes from lmodern and the code font is converted with otftotfm.)"""
+    engine = shutil.which("pdflatex")
+    if not engine:
+        sys.exit("hasknote-compile: pdflatex not found (use --tex-only to just write the .tex)")
+    with tempfile.TemporaryDirectory(prefix="hasknote-tex-") as tmp:
+        build = Path(tmp)
+        for run in (1, 2):
+            r = subprocess.run([engine, "-interaction=nonstopmode", "-halt-on-error", "-file-line-error",
+                                f"-output-directory={build}", tex_path.name],
+                               cwd=tex_path.parent, capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                log = (build / (tex_path.stem + ".log"))
+                text = log.read_text(errors="replace") if log.exists() else r.stdout
+                lines = text.splitlines()
+                errs = [k for k, l in enumerate(lines) if l.startswith("!") or re.match(r"^\S+\.tex:\d+:", l)]
+                shown = []
+                for k in errs[:5]:
+                    shown += lines[max(0, k - 2):k + 6]
+                sys.stderr.write("\n".join(shown or lines[-40:]) + "\n")
+                sys.exit(f"hasknote-compile: pdflatex failed (run {run}); the .tex is kept at {tex_path}")
+        shutil.copyfile(build / (tex_path.stem + ".pdf"), pdf_path)
 
 
 # --------------------------------------------------------------------------
@@ -1392,7 +2154,8 @@ def main() -> None:
     ap.add_argument("--width", type=int, default=760, help="--md-snippet: content width in CSS px (default 760)")
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--html-only", action="store_true", help="only write the HTML")
-    g.add_argument("--pdf-only", action="store_true", help="only write the PDF")
+    g.add_argument("--pdf-only", action="store_true", help="only write the .tex, its figures and the PDF")
+    g.add_argument("--tex-only", action="store_true", help="only write the .tex and its figures (no pdflatex run)")
     ap.add_argument("--title", help="document title (default: `-- title:` comment, else the humanized file name)")
     ap.add_argument("--subtitle", default=None, help="subtitle line under the title")
     ap.add_argument("--short-title", default=None, help="running header of the PDF (default: shortened title)")
@@ -1432,14 +2195,23 @@ def main() -> None:
     outdir.mkdir(parents=True, exist_ok=True)
 
     r = Renderer(a, nb)
-    if not a.pdf_only:
+    if not (a.pdf_only or a.tex_only):
         out = outdir / f"{nb.stem}.html"
         out.write_text(r.page(cells, "html"), encoding="utf-8")
         print(f"wrote {out}  ({r.fig_no} figures, {len(r.charts)} charts, {r.tab_no} tables)")
     if not a.html_only:
-        out = outdir / f"{nb.stem}.pdf"
-        print_pdf(r.page(cells, "print"), out, a.budget)
-        print(f"wrote {out}")
+        figdir = outdir / f"{nb.stem}-figures"
+        t = TexRenderer(a, nb, figdir)
+        tex = t.document(cells)
+        tex_path = outdir / f"{nb.stem}.tex"
+        tex_path.write_text(tex.replace("pdflatex urep.tex", f"pdflatex {nb.stem}.tex"), encoding="utf-8")
+        export_charts(t.charts, figdir, a.budget)
+        print(f"wrote {tex_path}  (+ {len(t.charts)} vector figures in {figdir.name}/)")
+        r.missing += t.missing
+        if not a.tex_only:
+            pdf = outdir / f"{nb.stem}.pdf"
+            compile_tex(tex_path, pdf)
+            print(f"wrote {pdf}")
     for m in dict.fromkeys(r.missing):
         print(f"warning: chart not found: {m}", file=sys.stderr)
 

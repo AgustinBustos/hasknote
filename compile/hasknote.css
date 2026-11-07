@@ -50,7 +50,7 @@ a:hover { text-decoration: underline; }
   font-size: 13.5px; font-family: var(--caps); text-transform: lowercase;
   letter-spacing: 0.14em; color: var(--muted);
 }
-.eyebrow .file { font-variant: normal; text-transform: none; font-style: italic; letter-spacing: 0.02em; }
+.eyebrow .file { font-family: var(--serif); text-transform: none; font-style: italic; letter-spacing: 0.02em; }
 .title {
   margin: 0;
   font-family: var(--serif-17);
@@ -79,13 +79,13 @@ a:hover { text-decoration: underline; }
 .toc li.toc-2 { padding-left: 26px; font-size: 0.95em; }
 .toc li.toc-3 { padding-left: 52px; font-size: 0.92em; }
 .toc a { color: var(--ink); }
-.toc .secnum { display: inline-block; min-width: 34px; color: var(--muted); font-variant-numeric: lining-nums; }
+.toc .secnum { display: inline-block; min-width: 34px; padding-right: 8px; color: var(--muted); font-variant-numeric: lining-nums; }
 
 /* ---- headings and prose ---------------------------------------------- */
 h2.sec, h3.sec, h4.sec { font-family: var(--serif-12); font-weight: 700; line-height: 1.25; break-after: avoid; text-wrap: balance; }
 h2.sec { font-size: 25px; margin: 56px 0 18px; }
 h3.sec { font-size: 21px; margin: 40px 0 14px; }
-h4.sec { font-size: 19px; margin: 30px 0 10px; font-family: var(--caps); letter-spacing: 0.05em; }
+h4.sec { font-size: 19px; margin: 30px 0 10px; font-family: var(--caps); font-weight: 400; letter-spacing: 0.05em; }
 .sec .secnum { margin-right: 14px; font-style: normal; color: var(--ink-2); font-variant-numeric: lining-nums; }
 
 p.prose { margin: 0 0 14px; hyphens: auto; break-after: avoid; }
@@ -295,6 +295,7 @@ figcaption .sub { color: var(--ink-2); }
   .grid { grid-template-columns: minmax(0, 1fr); }
   figure.fig.panels { width: 100%; margin-left: 0; }
   .code { padding: 18px 12px 10px; }
+  .code pre { font-size: 0.72em; }
   .out { padding-left: 12px; }
   .mat td { padding: 0 6px; font-size: 16px; }
   table.booktabs { font-size: 15px; }
@@ -331,7 +332,7 @@ figcaption .sub { color: var(--ink-2); }
   p.runin { font-size: 11pt; margin-bottom: 2mm; }
   .cell { margin-bottom: 7mm; }
   .cell > * + * { margin-top: 2.5mm; }
-  .cell > .fig, .cell > .tbl { margin-top: 5mm; }
+  .cell > .fig, .cell > .tbl { margin-top: 3.5mm; }
   .label { right: auto; left: auto; position: absolute; top: 1.4mm; right: 2.2mm; font-size: 7pt; }
   .out > .label { top: 0.3mm; right: 0; }
   .code { padding: 2.6mm 3.4mm; border-radius: 3px; break-inside: avoid; }
@@ -346,7 +347,7 @@ figcaption .sub { color: var(--ink-2); }
   table.booktabs th.sub { font-size: 8.8pt; }
   figure.tbl { break-inside: avoid; }
   figure.fig, figure.fig.panels { width: 100%; margin-left: 0; break-inside: avoid; }
-  .grid { gap: 3mm 16px; }
+  .grid { gap: 2mm 16px; }
   .chart, .chart.panel-chart { aspect-ratio: auto; margin: 0 auto; }
   figcaption { font-size: 9.6pt; margin-top: 2.6mm; max-width: none; }
   .subcap { font-size: 8.8pt; }
@@ -370,7 +371,7 @@ figcaption .sub { color: var(--ink-2); }
 .md table.md-table td, .md table.md-table th { text-align: left; }
 .md strong { font-weight: 700; }
 .math.block, .math.display { display: block; margin: 14px 0; text-align: center; overflow-x: auto; overflow-y: hidden; }
-.katex { font-size: 1.08em; }
+.katex { font-size: 0.93em; }
 .katex-display { margin: 14px 0; }
 
 /* ---- snippet renderer (--md-snippet) --------------------------------------- */
